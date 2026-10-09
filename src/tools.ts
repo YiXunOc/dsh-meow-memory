@@ -9,9 +9,11 @@
  */
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { isAbsolute, resolve } from 'node:path'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
+import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
 const T = (key: string): string => keyedValue('tools', key)
@@ -20,6 +22,32 @@ const L = (key: string, params?: Record<string, string>): string => fillTemplate
 import { buildProjectSectionText, markProjectQueried, markWritten, readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
 
 export type { Level }
+
+// ── 记忆门控（issue #38/#28）：host 注册工具时注入判定器 ─────────────────────
+// 读档 = skip_inject / disabledWorkspaces → search/read/findSimilar/project 拒绝；
+// 写档 = skip_write / disabledWorkspaces → remember/update 拒绝（整理轮豁免由 host
+// 侧的 refuseWrite 闭包判定——工具层不感知轮次语义）。refusal 文案随既有工具错误
+// 通道（throw new Error）走，模型可直接读到原因。
+export interface MemoryToolGate {
+  refuseRead?: (workspace: string, sessionId: string | null) => string | null
+  refuseWrite?: (workspace: string, sessionId: string | null) => string | null
+}
+
+let toolGate: MemoryToolGate | undefined
+/** host 在 apply 时注入门控判定器（活配置闭包；随插件重载重建）。 */
+export function setMemoryToolGate(gate: MemoryToolGate | undefined): void {
+  toolGate = gate
+}
+
+/** 门控检查：拒绝时抛出带理由的 Error（工具错误的既有通道）。 */
+function refuseOrThrow(kind: 'read' | 'write', exec: ToolRunContext): void {
+  if (toolGate === undefined) return
+  const workspace = workspaceOf(exec)
+  if (workspace === undefined) return
+  const sessionId = sessionIdOf(exec)
+  const refusal = kind === 'read' ? toolGate.refuseRead?.(workspace, sessionId) : toolGate.refuseWrite?.(workspace, sessionId)
+  if (refusal !== null && refusal !== undefined) throw new Error(refusal)
+}
 
 // ── 参数通道兜底（issue #24）────────────────────────────────────────────────
 // 部分宿主/模型走 XML 参数通道时，schema 声明为 array/number/boolean 的值会以
@@ -210,6 +238,7 @@ function rememberTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('write', exec)
       const parsed = args as { content?: unknown; level?: unknown; project?: unknown; subcategory?: unknown; goal?: unknown; importance?: unknown; corrected?: unknown; keywords?: unknown }
       const content = typeof parsed.content === 'string' ? parsed.content.trim() : ''
       // 四必填：缺失逐个报错并引导重填（用户拍板 2026-08-19）。
@@ -372,6 +401,7 @@ function searchTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { query?: unknown; level?: unknown; project?: unknown; status?: unknown; days?: unknown; k?: unknown; content_max?: unknown }
       const query = typeof parsed.query === 'string' ? parsed.query.trim() : ''
       if (!query) throw new Error('memory_search: query 必填且不能为空（例：{"query": "关键词"}）；浏览项目全貌请用 memory_project')
@@ -507,6 +537,7 @@ function findSimilarTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { id?: unknown; k?: unknown; content_max?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_find_similar: id 不能为空')
@@ -599,6 +630,7 @@ function readTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { id?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_read: id 不能为空')
@@ -667,6 +699,7 @@ function updateTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('write', exec)
       const parsed = args as { id?: unknown; content?: unknown; status?: unknown; importance?: unknown; goal?: unknown; project?: unknown; keywords?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_update: id 不能为空')
@@ -743,6 +776,7 @@ function projectTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { project?: unknown }
       const project = typeof parsed.project === 'string' ? parsed.project.trim() : ''
       if (!project) throw new Error('memory_project: project 不能为空')
@@ -769,11 +803,69 @@ function projectTool(dir: string): ToolDefinition {
   }
 }
 
+/** 全局数据目录查看/切换（用户拍板 2026-09-25）：对用户=说一句话即可换目录，
+ *  零代码零重启——不依赖 dsh 0.1.7 设置页写入链（其真机写入被拒、拒因静默）。
+ *  切换=插件内部 switchHomeDir（同盘移动/跨盘复制+旧目录绝不自动删+失败留原地）。 */
+function homeTool(): ToolDefinition {
+  return {
+    name: 'memory_home',
+    description: T('memory_home.description'),
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        target: { type: 'string', description: T('memory_home.param.target') },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['note'],
+        properties: { note: { type: 'string', description: T('memory_home.out.note') } },
+      },
+      render: (_args, value) => {
+        const v = value as { note?: string }
+        return [{ type: 'text' as const, text: String(v.note ?? '') }]
+      },
+    },
+    async execute(args: unknown) {
+      const parsed = args as { target?: unknown }
+      const presets = homeDirPresets()
+      const raw = typeof parsed.target === 'string' ? parsed.target.trim() : ''
+      if (raw === '') {
+        return { note: [
+          `当前全局数据目录：${activeHomeDir()}`,
+          `预设 default（系统用户主目录）：${presets.default}`,
+          `预设 dsh-storage（DSH 根目录 Storage）：${presets['dsh-storage']}`,
+          `预设 plugin-root（插件本体根目录）：${presets['plugin-root']}`,
+          `不修改则不传 target；要切换请传预设标记或绝对路径。`,
+        ].join('\n') }
+      }
+      const LEGAL = ['default', 'dsh-storage', 'plugin-root']
+      const target = resolveHomeDir(raw)
+      // 非法输入防误切：resolveHomeDir 会把非法值回落默认——这里识别出来直接报错
+      const downgraded = target === resolveHomeDir(undefined) && !LEGAL.includes(raw)
+      if (downgraded) {
+        return { note: `无法识别的 target："${raw}"（可用预设标记或绝对路径）。当前目录未变：${activeHomeDir()}` }
+      }
+      const sw = switchHomeDir(target)
+      if (sw.mode === 'same') return { note: `全局数据目录本就是 ${sw.to}，未变更。` }
+      if (sw.mode === 'failed') return { note: `切换失败：${sw.error}。仍使用 ${sw.from}，数据未受影响，可稍后重试。` }
+      if (sw.mode === 'reused-nonempty') return { note: `已切换为 ${sw.to}（目标目录已有内容，直接启用、未覆盖）。旧目录 ${sw.from} 原样保留。` }
+      if (sw.mode === 'rename') return { note: `已切换为 ${sw.to}：自 ${sw.from} 移动 ${sw.files} 项完成（同盘移动）。如本机有多个 dsh 实例共享旧目录，请同步修改它们的设置。` }
+      return { note: `已切换为 ${sw.to}：自 ${sw.from} 复制 ${sw.files} 项（跨盘复制为快照）。旧目录 ${sw.from} 保留未删，确认无误后可手动删除；若多个 dsh 实例共享旧目录，请同步修改其他实例的设置。` }
+    },
+  }
+}
+
 export function registerMemoryTools(register: (t: ToolDefinition) => void, dir = '.dsh-meow'): void {
+  // 门控判定器经 setMemoryToolGate 注入（apply 期设置；工具工厂签名保持不变）。
   register(rememberTool(dir))
   register(searchTool(dir))
   register(findSimilarTool(dir))
   register(readTool(dir))
   register(updateTool(dir))
   register(projectTool(dir))
+  register(homeTool())
 }

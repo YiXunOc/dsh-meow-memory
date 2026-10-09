@@ -1,8 +1,9 @@
 /**
  * meow-memory — 反思轮折叠：纯计算逻辑（与 DOM 无关，可单测）。
  *
- * 识别：会话快照 chat 节点里 kind='context' 且 source 为
- * { kind: 'plugin', plugin: 'meow-memory' } 的节点 = 反思/dream 轮 prompt
+ * 识别：会话快照 chat 节点里 kind='context' 且 source 由本插件生产
+ * （{ kind: 'plugin:meow-memory' }；旧会话为 { kind: 'plugin', plugin: 'meow-memory' }）
+ * 的节点 = 反思/dream 轮 prompt
  * （steer/followup 注入的 user/message 事件，非 append 改写，渲染为 context 行）。
  * 范围（2026-09-10 双形状）：
  * - 独立轮（host 走 followup：prompt 即 turn 首节点）：整个 turn 折叠，
@@ -24,13 +25,19 @@ import type {
   ChatNode,
   ToolChatData,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { t } from './i18n/index.js'
+import { isMeowSource } from './source.js'
+
+/** 测试接点（与 client-delegate-notice 的 setDreamStatesForTest 同款惯例）：界面
+ *  语言。生产代码只读 DSH locale 服务，唯一的写入入口在 i18n core 里。 */
+export { setUiLocaleForTest, getUiLocale } from './i18n/index.js'
 
 /** 反思轮识别标记（与 host 端 reflect.ts / dream.ts 保持一致）。 */
 export const REFLECT_MARKER = '[meow-memory-reflect]'
 export const DREAM_MARKER = '[meow-memory-dream]'
 
-/** 插件 source 识别（与 host 端 PLUGIN_SOURCE 保持一致）。 */
-export const PLUGIN_NAME = 'meow-memory'
+/** 插件 source 识别（生产端见 host 端 source.ts）。 */
+export { PLUGIN_NAME } from './source.js'
 
 export type FoldVariant = 'reflect' | 'dream'
 
@@ -94,8 +101,8 @@ function contextText(node: ChatNode): string {
 /** 判定节点是否 meow-memory 注入的反思/dream prompt。 */
 function isMemoryPrompt(node: ChatNode): boolean {
   if (node.kind !== 'context') return false
-  const source = (node.data as ContextLike).source as { kind?: string; plugin?: string } | undefined
-  if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) return false
+  const source = (node.data as ContextLike).source
+  if (!isMeowSource(source)) return false
   const text = contextText(node)
   return text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)
 }
@@ -195,14 +202,22 @@ export function memoryTurnNumbers(snapshot: ConversationSnapshot): ReadonlySet<n
   return out
 }
 
-/** 横条文案（产品 copy，中文）。 */
-export function foldLabel(group: FoldGroup, expanded: boolean): string {  const arrow = expanded ? '▾' : '▸'
-  const title = group.variant === 'dream' ? '记忆梦境任务' : '记忆反思'
-  if (group.status === 'running') return `${arrow} ${title}进行中…`
-  if (group.status === 'interrupted') return `${arrow} ${title}已中断`
-  if (group.rememberCount > 0) return `${arrow} ${title} · 新增记忆 ${group.rememberCount} 条`
-  if (group.updateCount > 0) return `${arrow} ${title} · 已更新 ${group.updateCount} 条`
-  return `${arrow} ${title} · 无需记忆`
+/** 横条文案（产品 copy，经 i18n 层：跟随 DSH 语言设置 zh/en/pt-br）。
+ *  dream 运行期带「插话会拼进本轮」提示（issue #20，用户拍板 2026-09-20）：dream 轮
+ *  运行中用户插话会被宿主 steering（next-step）拼进本轮、由同一回复一起消化；横条上
+ *  明说，避免"问题被吞了"的困惑。反思轮不提示——反思通常在长任务收尾排队，插话拼
+ *  进去的困惑远低于 dream（整轮都在做记忆整理）。 */
+export function foldLabel(group: FoldGroup, expanded: boolean): string {
+  const arrow = expanded ? '▾' : '▸'
+  const title = t(group.variant === 'dream' ? 'fold.title.dream' : 'fold.title.reflect')
+  if (group.status === 'running') {
+    const hint = group.variant === 'dream' ? t('fold.hint.running') : ''
+    return `${arrow} ${t('fold.status.running', { title })}${hint}`
+  }
+  if (group.status === 'interrupted') return `${arrow} ${t('fold.status.interrupted', { title })}`
+  if (group.rememberCount > 0) return `${arrow} ${t('fold.status.remembered', { title, n: group.rememberCount })}`
+  if (group.updateCount > 0) return `${arrow} ${t('fold.status.updated', { title, n: group.updateCount })}`
+  return `${arrow} ${t('fold.status.nothing', { title })}`
 }
 
 /** 渲染一个 tool 调用的详情文本：名称 + 格式化参数（JSON pretty）。 */
@@ -264,7 +279,7 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
     if (node.kind === 'context') {
       const ctx = node.data as ContextLike
       const source = ctx.source as MemorySourceLike | undefined
-      if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) continue
+      if (!isMeowSource(source)) continue
       // 元数据在 source.sections 的 __meta__ 节（与 dsh 快照一致；host v0.25+ 写入）；
       // 回退旧 source.memory（v0.24- 历史会话）。
       const meta = extractMetaFromSections(source.sections) ?? source.memory
@@ -310,8 +325,8 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
 }
 
 /** 注入用户消息的时间标签。与 dsh 本体 formatMessageClock 同规则（同天 HH:mm、
- *  今年「M月D日 HH:mm」、跨年「Y年M月D日 HH:mm」，中文产品文案），供插件自绘的
- *  注入消息操作行使用——本体按钮的复制文本闭包含注入前缀，无法直接复用。
+ *  今年「M/D HH:mm」、跨年「Y/M/D HH:mm」，文案经 i18n 层，跟随 DSH 语言设置），
+ *  供插件自绘的注入消息操作行使用——本体按钮的复制文本闭包含注入前缀，无法直接复用。
  * @param time - 消息事件时间（Unix epoch ms）。
  * @param now - 参考时刻（默认当前；测试可注入）。
  * @returns 时钟字符串（24 小时制补零）。
@@ -326,7 +341,7 @@ export function formatInjectionClock(time: number, now: number = Date.now()): st
     && d.getDate() === n.getDate()
   if (sameDay) return clock
   const md = d.getFullYear() === n.getFullYear()
-    ? `${d.getMonth() + 1}月${d.getDate()}日`
-    : `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`
+    ? t('datetime.ymd', { m: d.getMonth() + 1, d: d.getDate() })
+    : t('datetime.ymdFull', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() })
   return `${md} ${clock}`
 }

@@ -1,5 +1,166 @@
 # Changelog
 
+## v0.31.0 (2026-10-07)
+
+### 新增：窗口级「记忆参与」门控（#38）+ 工作区停用名单（#28）
+
+- 会话"…"菜单新增**记忆参与**面板（点击菜单项弹出，菜单长度不变）：两个开关，状态列直陈「打开/关闭」——
+  - **自动注入**（首轮快照、每轮关键词命中、压缩后重注入）：关闭后窗口不被共享记忆影响；
+  - **自动整理**（反思、梦境）：关闭后不自动整理（手动 /dream 不受限，手动=明确意愿）。
+- 两开关的 4 种组合全部命名、菜单项恒带状态后缀：**功能全开 / 不自动注入 / 不自动整理 / 只用工具**（不再出现「自定义」）。记忆工具默认开着不关——想限制 AI 调用口头告知即可。
+- 行图标一条规则：**划线月 ⟺ 该窗口关了自动整理**，其余一律正常月亮（已整理=淡黄月、进行中=呼吸灯不变）。
+- 工作区停用名单 `disabledWorkspaces`（设置页可配，路径归一精确匹配，即改即生效）：命中工作区读/整理/写全拒（含手动 /dream），一次性任务的工作区不再污染记忆库。
+
+### 新增：记忆库防误删兜底（#37 增量）
+
+- **首建提示**：工作区记忆库刚创建（仍为空）时，随首轮注入一条独立通知——库位置、误删不 recover、.gitignore 建议、memory_home 迁出与 backup 兜底指引（每会话至多一次，三语）。
+- **可选自动备份**：`backup.enabled`（默认关，改动需重载）——每次 dream 收尾把 memory.db 以 `VACUUM INTO` 快照轮转到 memory.db.bak（一致性备份，mtime 判增量幂等，WAL 感知，失败静默不碍主流程）。
+
+### 测试
+
+- host 500→520（门控三档与工具门、工作区匹配、备份全链路）；client-dream-skip 重写 25→31（状态命名/标签/面板注入）；client-i18n 61→67（part.* 三语键位）。全量 exit=0。
+
+## v0.30.0 (2026-10-07)
+
+### 修复：设置页配置不生效（#26）——热字段即改即生效，无需重启
+
+- 两层根因（报告人 @7Crimson7 实机定位）：① 250ms 有界等待在重 profile 上必输（settings 命名空间实测晚 5.5s 就绪），`settingsGet` 恒 undefined，`resolved` 全按出厂默认跑满进程生命周期；② `resolved` 在 apply 期一次定型，onChange 只热切 homeDir，`meta.volatile` 在 cordis 中无实现（死标记），「重载后生效」对绝大多数字段不成立。
+- **活配置**：`resolved` 热字段（hitTopK/titleMax/reflect/reflectTurns/autoMigrate/promptLang + dream 全系 7 键）getter 化，背后接按引用相等做变更检测的缓存读取器（0.1.3+ 提交前返回同一 frozen 对象，引用没变即未变；0.1.7 describe 壳引用恒新，250ms 节流兜底）——不重排 40+ 消费点，现有 `resolved.X` 读取自动变活。
+- **scheduleDream 自调度**：setInterval → 自调度 setTimeout（cfg 双模式：对象兼容旧调用 / getter 活读）——checkMinutes 变活值；enabled=false 的 tick 在任何 DB 操作（含 60s 检查门 SQLite 往返）前短路；启停转换打日志（去「静默跳过 vs 没跑」观测盲点）。
+- **rulesReviewDays 双模式**（数字兼容 / getter 活读），dreamTool/dreamCommandDefinition 每次触发现读。
+- **promptLang 热刷新**：onChange / 0.1.7 write 壳重调 setPromptLang（运行时 T() 文案热切；工具描述与手册段为注册期文案，保持启动语言）。
+- 注册期字段保持冻结（projectDir/homeDir/enabled/delegate.modelSpec，与报告人同口径：热改需 dispose+重入）；竞速输掉升级为 warn 日志，热字段会在命名空间就绪后自动纠正。
+
+### 修复：dream 自动轮静默失败丢记忆（#36）
+
+- 根因（宿主逐版本实证 0.1.5-rc.1 起一致，与版本无关）：`agents.resume()` 不传 agentOptions 时宿主按 `{}` 处理——复活 agent 无 provider/model，人设 `{{model}}` 严格插值抛错 + `prepareRequest` 空 route 二次抛，重启后非 live 窗口的自动 dream **必然**产生凭空失败轮。
+- **resume 组装路由**：优先恢复会话日志最近一次 `request/header` 的原路由（多帧 zstd 逐帧解压复用 migrate-v0 解压器；同模型才命中 prompt cache 前缀），回退 `agentDefaultModel.currentSelection()`（与宿主新建会话同源），均无才裸 resume。
+- **失败即时处理**：`session/event` 的 turn/end error（实证宿主 turn-stopping 只在 step 成功后发射，首个 step 前的失败对它是死代码）→ 有租约则失败计数 +1 后释放重试；「裸轮」error（全程零 user/message，任务被 claim 后未及落盘就崩溃的形状）+ 活跃租约同样处理。
+- **零进展不盖章**：group_idx=0 的中断补收尾改为记数释放（下个 sweep 自动重试，dedup 合并兜底幂等）；连续 3 次才封存止损（warn 留痕，不再无声）。计数落 dream_meta，T 变化重计，finishDream 清零。
+- 广播修正：失败释放 ≠ 整理完成——去月亮（active）而非 dreamed。
+
+### 修复：冷启动设置页 UI 卡英文（#32，#33 同症状）
+
+- 回退路径区分两种「没服务」：ctx.get 存在但 locale 服务未注册（纯时序）→ 有界轮询重入 installI18n（幂等，1s × 30 封顶自清，不挂 dispose），就绪即注册 + notify（DOM 重放层随动，文案无需重启即纠正）；ctx 连 get 都没有（老宿主/受限动态包）→ 永久回退不重试（v0.28.0「locale 不进 inject」红线保留）。
+
+### 修复：0.1.7+ 装配每轮抛误导性 error（#34）
+
+- `installSettingsSectionCompat` 在 register 缺席时不再 throw（throw 落在 inject 回调里、外层 catch 接不住）：0.1.7+ 形态（原型带 describe）静默跳过注册（设置页由 schema describe 自动表单接管，值读写走 v0.29.0 兼容腿）；其余未知宿主 warn 留痕。纯降级改动，0.1.2–0.1.6 行为不变。#35（0.2.0-rc.2 冷启动不弹窗）疑似同根，升级后待复测。
+
+### 加固：update 短 id 前缀歧义拒绝（#23 复盘顺带）
+
+- 短 id（模型截断输出）的前缀匹配保留，但 update 前先解析：唯一命中升级为全 id 精确更新；多行命中拒绝并 warn（不再静默改掉一批无关注记）；零命中与旧行为一致返回 false。全 id 路径逐字节不变。
+
+### 其他
+
+- pt-br 语言包补齐 `memory_home` 缺失键位（#39，感谢 @coutogilson）。
+
+### 测试
+
+- host 467→500（#36 失败处理与计数 13 项、活配置/tick 15 项、短 id 歧义 5 项）；client-i18n 61→67（locale 晚到重试 6 项）。全量 500+11+67+66+24+25 绿。
+
+## v0.29.0 (2026-09-25)
+
+### 新增：全局数据目录可配置（homeDir）——三预设 + 自动迁移 + 热切换
+
+- 设置页新增「目录与迁移」分组：**全局数据目录**支持三个预设（`default`=平台用户主目录 `~/.dsh-meow`、`dsh-storage`=`<DSH_HOME>/storages/meow-memory`、`plugin-root`=插件根 `storage/`）与自定义绝对路径，预设旁显示服务端解析的实际落点；radio 下方为逐项目的**记忆目录**（projectDir）与**自动迁移旧库**开关。设置页布局同步调整：总开关置顶，目录三件垫底。
+- **迁移语义（安全红线）**：目标与当前相同则不动；目标非空视为已迁移，直接启用绝不覆盖；目标为空先试同盘 `rename`（瞬移），跨盘/占用降级递归复制——**旧目录任何情况下都不自动删除**，搬完落 `home-dir.json` 标记。
+- **热切换**：保存后后台异步搬移、搬完即切（模块级状态口，全部消费点动态化），dsh 不重启、插件不重载、在跑会话无感知。
+- 全局日志清扫同步落地：白名单四日志超 48h 删除、`perf.log` 超 5MB 轮转保一代。
+
+### 新增：`memory_home` AI 工具——说一句话即可查看/切换目录
+
+- 主模型工具（无参=查询当前目录与三个预设的实际位置；`target`=预设标记或绝对路径→解析+迁移+热切换），结果以人话回报（含「旧目录保留可手动删」「多实例请同步修改」提醒）。非法 `target`（空/相对路径/盘根/主目录本身）会被识别并拒绝，不会误切到回落默认。零代码零重启，完全绕开设置写入链。
+
+### 修复：dsh 0.1.7 设置写入与显示（值冻结 / 拒写 / radio 不跟手）
+
+- **准入**：Config 全字段带 `meta.volatile` shim 进入 0.1.7 设置命名空间（宿主解析走插件自带 schemastery，值保持裸形状，消费端零改动；0.1.6 无感）。
+- **拒写**：bundle 自带 insert 行不再携带 config 初值（0.1.7 写盘前要求「全量合并 ≡ 写入值」，insert 初值会导致永久 `settings/rejected`）；0.1.6 装载依赖的 insert 行保留。
+- **值冻结**：0.1.7 的 `write` 只落盘不重载条目，`describe.value` 停在启动值（官方命名空间靠 volatile 活引用现读现解所以无感，本插件 shim 后值为裸快照）。宿主侧 `describe`/`write` 原型壳：meow 行 value 现场重算（base⊕user）+ base 注入 `homeDirPresets`；write 成功后补跑 homeDir 热切换（0.1.7 无 scope.watch 的等价通知）。radio 只认已保存镜像值、输入类控件保存后保留草稿——两边都不再闪回。
+- 客户端 `remote.settings` 进 inject 清单（写入失败探针直调宿主拿拒因，rejectGuard 复合键要求）。
+
+### 改进：dream 菜单行对齐官方样式
+
+- 「记忆整理」行补中文主名 + `dream` 别名 span（样式抄官方行），月亮图标与短描述不变。
+
+### 测试
+
+- host 461→467（home-dir 18 项、0.1.7 原型壳 6 项）；`tests/settings-page.mjs` 55→66（homeDir 控件、双版本挂载补强）；新增 `tests/config-volatile.mjs`（准入 shim + 裸值契约）。全量 467+11+61+66+24+25 绿。
+
+## v0.28.2 (2026-09-23)
+
+### 修复：dsh 0.1.7 的 v4 会话不再接受通用 source kind `plugin`（新会话整轮失败）
+
+- **问题**：session format v4 要求每条消息声明自己的生产者 kind，退役的通用 kind `plugin` 在写入侧（JSONL 落盘用的 `encodeCurrentEvent`）与读取侧（行准入）都被拒绝，报 `format v4 message requires a producer-owned source kind`。本插件的快照（snapshot）/ 通知（notice）/ 反思轮 / dream 轮消息此前都用 `{ kind: 'plugin', plugin: 'meow-memory' }`，于是在 0.1.7 上**新会话一注入就整轮失败**（界面表现为「本轮运行失败」）。停用整个插件可以规避，但记忆功能随之全部失效。
+- **为什么扫日志查不出来**：被拒的行在 encode 阶段就抛错，**根本写不进会话日志**——「扫当前 v4 日志、0 处失败」这种验收方式对本题无效（本地曾据此误判为已恢复）。
+- **修法**：改用 DSH 约定的第三方形态 `plugin:meow-memory`（= 官方 v3→v4 迁移器对历史会话的改写结果：`producerKind()` 对非官方插件产出 `plugin:<包名>` 并丢弃 `plugin` 字段），并在 `dsh-llm` 的 `MessageSourceMap` 上做声明合并登记自己的 kind（与 `time-context` / `agent-instructions` 等官方生产者同款）。
+- **识别端同步**：客户端折叠、delegate 打点、host 端反思计数与 `wasDreamTurn` 统一改用 `isMeowSource` 判定，**同时接受当前形态与退役形态**——退役形态用于尚未迁移的历史日志；而迁移后的历史会话本身就是当前形态，原判定 `kind === 'plugin' && plugin === 'meow-memory'` 在迁移丢弃 `plugin` 字段后必然失配，本次一并修好。
+- **测试**：5 处产物形态断言随实现更新；`tests/client-fold.mjs` 新增「两种形态同判、别的插件与无关 kind 不误判」用例。
+
+### 恢复：设置页「喵记忆」在 0.1.7 重新可见（configForms 腿，双版本兼容）
+
+- **背景**：0.1.7 移除了客户端 `settingsScope` 服务（旧设置页的读写通道），v0.27.1 的守卫因此在 0.1.7 上直接跳过注册——设置页消失，改配置只能手编 settings.yaml。**挂页的路本身没被堵死**：0.1.7 的 `settings.section` slot 原样健在（官方「通用」「账号」「Agent 预设」页同款注册形状），被删的只是读写服务。
+- **修法**：挂载改双版本两条腿——0.1.6 走 `settingsScope.bind({namespace})`（原链路一字不动）；0.1.7 走设置域基础服务 `configForms.get(entryId)`，其共享表单的 `getSnapshot/subscribe/set/unset` 与组件消费的 scope 形状同构（status/value/base/user/writable/mode、单层键、被拒写入静默 recover），**组件本体零改动**。Host 侧 `describe()` 自动把所有带 schema 的活跃插件列为命名空间（`ns`=entry id），本插件 Config 照常声明，数据源两版同源。
+- **时序**：`configForms` 不进 inject 清单（0.1.6 没有该服务，写进清单会整插件 pending），客户端组合顺序也不保证提供方先起——短轮询（400ms，约 30s 上限）等它就绪再挂页；等不到只留一行日志，不影响插件其余功能。
+- **注意**：共享表单由 configForms 提供方持有并随其卸载，插件侧不 dispose（dispose 后 forms 表仍缓存该实例，热重载会拿到死表单）。
+- **测试**：`tests/settings-page.mjs` 新增第 4 节「双版本挂载」——0.1.6 软取腿、0.1.7 表单当 scope、双缺安全降级（轮询自行放弃）、configForms 迟到轮询等到即挂页、dispose 清理，42→55 项。
+
+## v0.28.1 (2026-09-23)
+
+### 修复：已删除的工作区目录不再被启动流程复活（#27）
+
+- **问题**：apply 恢复窗口索引时会把 `window-index.json` 里记录的**每一个**工作区交给 `getDb()` 打开，`MemoryDb` 构造函数的 `mkdirSync(recursive)` 连带把用户已删除的工作区根目录补建回来，并生成一份全新空 `memory.db`。`loadWindowIndex` 缺 `existsSync` 守卫——同项目 `collectDreamStates` / skip-dreams 路由两处都有同款守卫，属漏判。
+- **修法**：`loadWindowIndex` 对每个 workspace 加双守卫（工作区目录存在 + 库文件存在）才打开库；`window-index.json` 里的 sid→workspace 映射恢复不受影响，只是不再为已消失的工作区新建任何东西。另将 `loadWindowIndex` 导出并参数化 `indexFile`（供测试）。
+- **测试**：新增 3 条断言（存活工作区恢复不受影响 / 已删除目录不复活 / 存活目录不误删）。
+
+### 诊断：启动日志输出配置解析路径（issue #26 取证）
+
+- 新增一行启动日志 `config resolved (sourceReady=…, enabled=…, dream.enabled=…, promptLang=…, projectDir=…)`：用于定位「设置页配置不生效」类报告——`sourceReady=false` 即 settings 服务晚于有界等待（250ms）就绪的冷启动竞态（大 profile 上插件树加载慢时可能出现）。已在 issue #26 请报告人提供该行与确切 DSH 版本，根因确认后再定修复策略（盲改等待上限属症状补丁）。
+
+
+## v0.28.0 (2026-09-23)
+
+### 内置巴西葡语 prompt 语言包（src/prompts/pt-br/）
+
+- **新增 `src/prompts/pt-br/`**：9 个槽位（system-guide / reflect / dream-header / dream-atomic / dream-topic / dream-project-summary / welcome-guide / labels / tools）的巴西葡语翻译，`promptLang: 'pt-br'` 直接可用。贡献者母语为巴西葡语（不代签欧洲葡语，所以目录名用 `pt-br` 而非 `pt`）。
+- **`npm run check-lang -- pt-br` 绿**：与 `zh` 真源的键集（labels 47 键 / tools 43 键）、占位符集合、槽位清单逐项对齐；`project.global` 取 `global`（与 en 包一致——代码按该值匹配"全局适用"）。
+- **文档**：`src/prompts/README.md` 的目录结构补上 `en/` 与 `pt-br/`，并写明 `promptLang` **逐字匹配目录名**（`pt` 不会解析成 `pt-br`），名字不存在时静默落回 `zh` 包——这正是本地实例包踩过的坑。`README.md` / `README.en.md` / `README.pt-br.md` 的 `promptLang` 段同步补上 `pt-br` 与逐字匹配说明。
+
+### 界面文案层：UI/UX 跟随 DSH 语言设置（zh / en / pt-br）
+
+- **问题**：界面文案（折叠横条、打点气泡、会话菜单项、设置页全部字段）硬编码中文，非中文用户看到的是中英混杂的界面——`promptLang` 只管模型文案，管不到 UI。
+- **分层**：界面文案与模型文案分家。新增 `src/i18n/`（UI 层，跟随 DSH 语言设置）与既有 `src/prompts/<lang>/`（模型层，跟随 `promptLang`）互不影响：界面可以跟随外壳切成英文/葡语，注入给模型的 prompt 仍按 `promptLang` 走。
+- **跟随 DSH**：`installI18n(ctx)` 经 `ctx.get('locale')` 探测 DSH 0.1.5+ 的 locale 服务（**不写进 `inject`**——写进去会让插件在无 locale 的老宿主/受限动态包上整体挂起），注册 `addLanguage({ id: 'pt-br', label: 'Português (Brasil)', fallback: 'en' })` 与三语字典；查表走服务自己的 fallback 链（pt-br 缺键自动落 en，绝不出现空串）。设置页标签按官方契约在语言切换时重新注册；纯 DOM 节点（横条/气泡/菜单项）经 `registerUiReplayer` 重放注册表刷新；设置页经 `onUiLocaleChange` 重渲染。
+- **降级**：无 locale 服务（老宿主 / 动态包）→ `navigator.languages` 判定 + 内置静态查表（zh → en），最终落 `zh`——浏览器为中文的中文用户界面不变，浏览器要英文的用户现在拿到英文（这正是本次改动的目的）。语言/字典注册任何一步失败只告警，UI 退化不改插件行为。
+- **新增语言**：加一个字典文件 + `SUPPORTED_UI_LOCALES` 一行即可（`Record<UiKey, string>` 类型与测试卡住缺键/多余键），不改 UI 代码。文档见 `src/i18n/README.md`。
+- 文案键集 `zh` 侧逐字保留外置前的中文，中文用户视角是纯重构。
+- **设置页提示 ≠ 模型语言包**（review 修正）：`promptLang` 只选 `src/prompts/` 的模型文案包（当前内置 `zh` / `en`），界面语言由 DSH 的语言设置决定。提示里不再宣称内置 `pt-br` 语言包（`pt-br` 只是 UI 语言 id），并明说界面语言与它无关——避免用户照提示设 `promptLang: pt-br` 后静默落回中文包。测试补了对应回归断言。
+- **与 issue #20 合并**：dream 运行中横条的「插话会拼进本轮」提示（上游 0405e1a）在 i18n 层里落成新键 `fold.hint.running`（zh/en/pt-br 三语），逻辑与文案分离。
+
+### 文档
+
+- 新增 **`README.pt-br.md`**（葡萄牙语巴西版 README，与中文版逐节对应），三个 README 顶部语言切换表互相打通；`README.md` / `README.en.md` 补「界面语言」一节。
+- `src/i18n/README.md`：UI 文案层的架构、跟随 DSH locale 的接线、降级路径，以及「加一门语言 = 一个字典文件 + `SUPPORTED_UI_LOCALES` 一行」的贡献指南。
+
+### 测试
+
+- 新增 `tests/client-i18n.mjs`（61 项：三语键集/占位符一致、静态查表、语言订阅、DSH 服务接线含 fallback 链与幂等/降级、各模块三语输出、重放注册表）与 `tests/settings-page.mjs`（42 项：标签随语言重注册、页面渲染文案、峰时解析错误文案本地化）；`client-fold` / `client-dream-skip` / `client-delegate-notice` 补 en / pt-br 断言，issue #20 的提示断言保留并补齐三语。
+## v0.27.1 (2026-09-23)
+
+### dsh 0.1.7 兼容：settingsScope 客户端服务已删，移出强制 inject（三处）
+
+- **问题**：0.1.7 删除了客户端 `settingsScope` 服务，本插件客户端模块的 inject 清单带着它 → 整个插件 pending（"waiting for service: settingsScope"），折叠/图标/委托气泡全部不上场。
+- **修法**：settingsScope 移出强制 inject 数组；设置页挂载改 `ctx.get('settingsScope')` 软取并加缺省守卫（0.1.7 上设置页不注册，其余功能不受影响）。注意 cordis 对未声明服务的属性访问会抛 rejectGuard，可选链防不住，必须 ctx.get。0.1.6 上服务仍在，行为不变。
+
+### 新增：0.1.7 指令菜单 dream 行换官方脸
+
+- 0.1.7 指令菜单里官方指令都是「图标 + 中文名 + 右对齐一句话描述」，dream 作为宿主目录行只有名字加长描述，无图标。新增 `client-menu-dream.ts`：客户端 DOM 装饰给 dream 行补 FA 空心月牙（样式类抄官方图标行）并把描述换成一句话；只锚定 0.1.7 菜单的 DOM 结构特征（`[data-trigger-menu]` + `dsh-slash-option-command-` 行 id），0.1.6 菜单天然不命中、服务端 description 原样保留。
+
+### 修复：`<style>` 标签自报家门
+
+- 0.1.6 加载器会认领无主 `<style>` 并在其他插件热替换时连坐删除，本插件的样式标签补 `data-plugin="meow-memory"` 自报家门。
+
+
 ## v0.27.0 (2026-09-20)
 
 ### 参数通道兜底：keywords 字符串形态不再误判「必填」（#24）

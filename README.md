@@ -1,7 +1,7 @@
 # meow-memory 🐱📝
 
-| [中文](README.md) | [English](README.en.md) | [MIT License](LICENSE) |
-| :---: | :---: | :---: |
+| [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
+| :---: | :---: | :---: | :---: |
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件。
 
@@ -183,11 +183,25 @@ dsh plugin --profile web remove meow-memory
 
 如果想让记忆整理换个（更便宜的）模型跑：配置 `delegate.model` 后，反思/梦境轮发起的每个 LLM 请求会经 dsh 的 `agent/request` waterfall 自动覆盖 provider/model，轮次结束自动换回主模型——正常对话、工具轮完全不受影响。实现是无状态的：按"当前 turn 是否携带反思/梦境指令标记"逐请求判定，用户中止、崩溃、热重载都不会留下"卡在换模型"的脏状态。
 
+### 界面语言：跟随 DSH 语言设置（v0.27.0）
+
+插件界面文案（折叠横条、打点气泡、会话菜单项、设置页）走独立的 **UI 文案层**，跟随
+DSH 的「设置 → 通用 → 语言」：内置 **中文 / English / Português (Brasil)** 三套字典，
+切换即时生效（设置页标签按官方契约重新注册，纯 DOM 节点经重放注册表刷新）。
+
+它与 `promptLang`（模型文案）是两层，互不影响：界面可以跟随外壳语言，而注入给模型的
+prompt 仍按 `promptLang` 走（`promptLang` 只选 `src/prompts/` 里的模型文案包，目前内置
+`zh` / `en`）。老宿主（无 locale 服务）自动降级为浏览器语言 + 内置字典，最终落 `zh`
+——中文用户浏览器也是中文时界面不变，浏览器要英文的用户则拿到英文（这正是本次改动的目的）。
+
+自定义 / 社区界面语言：加一个字典文件 + 在 `SUPPORTED_UI_LOCALES` 加一行（不改 UI 代码），
+详见 [`src/i18n/README.md`](src/i18n/README.md)。
+
 ### promptLang：prompt 与检索语言（重要）
 
 `promptLang` 决定两件事：①注入/反思/dream 文案的语言；②工具描述的语言。它同时影响模型写记忆条目用的语言——关键词按条目语言提取，**以你说话的语言为准**。
 
-**因此首次使用时请显式配置它**：`promptLang: 'zh'`（默认）或 `'en'`（内置英文语言包）。如果你的对话语言和界面语言不一致（比如界面英文、说话中文），**以你说话的语言为准**。
+**因此首次使用时请显式配置它**：`promptLang: 'zh'`（默认）、`'en'`（内置英文语言包）或 `'pt-br'`（内置巴西葡语语言包）。配置值就是子目录名，**逐字匹配**：填一个 `src/prompts/` 里不存在的名字（例如 `pt`）不会报错，而是静默落回中文包。
 
 检索侧说明：BM25 分词自 v0.20.0 起语言无关（类别路由），条目与查询语言不一致不再"杀检索"；`en` 模式额外启用英语归一化（停用词过滤 + Porter 词干还原），屈折变化不影响命中（`tokenizers` 能命中存为 `tokenizer` 的条目）。
 
@@ -240,6 +254,7 @@ npm run test           # 主逻辑、客户端、后台迁移与 tgz 制品测�
 - **[daveycodez](https://github.com/daveycodez)** — 英文语言包与英文分词（[PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6)，v0.22.0 发布）
 - **[chenmzh](https://github.com/chenmzh)** — 记忆注入改为独立 plugin snapshot 消息，根治会话标题污染（[PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10)）
 - **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — dsh 0.1.2-alpha.4 双版本 Session events 兼容（[PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11)）
+- **[coutogilson](https://github.com/coutogilson)** — 巴西葡语 prompt 语言包（`src/prompts/pt-br/`）与跟随 DSH 语言设置的界面文案层
 
 ## 📄 License
 

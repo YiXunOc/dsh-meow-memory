@@ -28,6 +28,9 @@ export const CONFIG_DEFAULTS = {
   reflect: true,
   reflectTurns: 7,
   autoMigrate: true,
+  /** 全局目录选择：''=默认（平台用户主目录）；预设标记或绝对路径见 home-dir.ts。
+   *  恢复默认写入 ''（而非删字段）=回落平台默认目录。 */
+  homeDir: '',
   dream: {
     enabled: true,
     idleMinutes: 180,
@@ -38,6 +41,12 @@ export const CONFIG_DEFAULTS = {
     rulesReviewDays: DEFAULT_RULES_REVIEW_DAYS,
   },
   delegate: { model: '' },
+  /** 记忆库自动备份（#37 增量②，默认关）：开启后每次 dream 收尾把 memory.db
+   *  快照轮转到 memory.db.bak（VACUUM INTO 一致性备份）。 */
+  backup: { enabled: false },
+  /** 工作区停用名单（#28）：列出的工作区（cwd 归一匹配）完全停用记忆——读/整理/写
+   *  全部拒绝（含手动 /dream）。用于一次性任务的工作区，避免污染记忆库。 */
+  disabledWorkspaces: [],
 }
 
 /** 字段形状（settings-page 的 FieldSpec 子集：sub 缺省=顶层标量，给定=dream/delegate 子键）。 */

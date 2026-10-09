@@ -4,9 +4,9 @@
  * 部分 2：apply 级（mock ctx：工具注册、pre-step 注入、turn-stopping 反思、disabled）。
  * 用法：node test.mjs（先 build）
  */
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, utimesSync } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import {
   apply,
   fillTemplate,
@@ -19,6 +19,7 @@ import {
   memoryDbPath,
   getDb,
   closeAllDbs,
+  loadWindowIndex,
   migrateLegacy,
   buildInjection,
   buildHitInjection,
@@ -46,6 +47,8 @@ import {
   advanceDream,
   abortDream,
   recoverInterruptedDream,
+  handleMemoryTurnFailure,
+  dreamSweepTick,
   dreamCommandDefinition,
   findSimilar,
   markInjected,
@@ -57,11 +60,25 @@ import {
   readWritten,
   getCurrentProject,
   setCurrentProject,
+  backupMemoryDb,
+  liveConfigReader,
+  applyLiveConfig,
+  setMemoryToolGate,
+  normalizeWorkspacePath,
+  workspaceDisabledMatch,
   hourInTimeZone,
   minutesInTimeZone,
   isDreamSuppressed,
   collectDreamStates,
   sessionEventsOf,
+  sweepHomeLogs,
+  DEFAULT_HOME_DIR,
+  activeHomeDir,
+  setActiveHomeDir,
+  dshHomeDir,
+  homeDirPresets,
+  resolveHomeDir,
+  switchHomeDir,
 } from './lib/index.js'
 
 let passed = 0
@@ -99,6 +116,79 @@ check('findById prefix match', byPrefix?.level === 'soul' && byPrefix.row.id ===
 const topicId = db.list('topic')[0].id
 check('update by prefix', db.update('topic', topicId.slice(0, 8), { status: 'active' }) &&
   db.list('topic', { status: 'active' }).length === 1)
+
+// ── 短 id 前缀歧义拒绝（#23 复盘顺带加固）：唯一前缀命中照常更新（精确化），多行命中拒绝 ──
+{
+  const ambA = db.insert({ level: 'fact', content: '歧义前缀甲' })
+  const ambB = db.insert({ level: 'fact', content: '歧义前缀乙' })
+  // 手工改成共享前缀（绕开 newId 的时间戳前缀天然唯一）
+  db.db.prepare('UPDATE fact SET id = ? WHERE id = ?').run('ambig-111111', ambA.id)
+  db.db.prepare('UPDATE fact SET id = ? WHERE id = ?').run('ambig-222222', ambB.id)
+  check('update: ambiguous short prefix refused', db.update('fact', 'ambig', { content: '被误改' }) === false)
+  check('update: ambiguous refusal changed nothing',
+    db.findById('ambig-111111')?.row.content === '歧义前缀甲' && db.findById('ambig-222222')?.row.content === '歧义前缀乙')
+  check('update: unique short prefix still works (exact upgrade)',
+    db.update('fact', 'ambig-1', { content: '精确命中' }) === true && db.findById('ambig-111111')?.row.content === '精确命中')
+  check('update: unique prefix left sibling untouched', db.findById('ambig-222222')?.row.content === '歧义前缀乙')
+  check('update: prefix with zero matches misses', db.update('fact', 'nomatch', { content: 'x' }) === false)
+}
+
+// ── 记忆参与门控（issue #38/#28）：db 三档 + 工具门 + 工作区停用 ───────────────
+{
+  // db：三档读写 / 全关删行 / listMemoryScopes / setDreamSkip 兼容委派
+  const wsG = mkdtempSync(join(tmpdir(), 'mm-scope-'))
+  const dbG = new MemoryDb(memoryDbPath(wsG))
+  check('scope: default all off', (() => { const sc = dbG.getMemoryScope('win-g1'); return !sc.dream && !sc.inject && !sc.write })())
+  dbG.setMemoryScopeField('win-g1', 'inject', true)
+  check('scope: inject on', (() => { const sc = dbG.getMemoryScope('win-g1'); return sc.inject && !sc.dream && !sc.write })())
+  dbG.setMemoryScopeField('win-g1', 'dream', true)
+  check('scope: dream+inject', (() => { const sc = dbG.getMemoryScope('win-g1'); return sc.inject && sc.dream })())
+  check('scope: listMemoryScopes returns detail', (() => {
+    const rows = dbG.listMemoryScopes()
+    return rows.length === 1 && rows[0].session_id === 'win-g1' && rows[0].dream === true && rows[0].inject === true && rows[0].write === false
+  })())
+  dbG.setMemoryScopeField('win-g1', 'dream', false)
+  dbG.setMemoryScopeField('win-g1', 'inject', false)
+  check('scope: all off removes row', dbG.getMemoryScope('win-g1').dream === false && dbG.listMemoryScopes().length === 0)
+  dbG.setDreamSkip('win-g2', true)
+  check('scope: setDreamSkip delegates to dream field', dbG.getMemoryScope('win-g2').dream === true && dbG.isDreamSkipped('win-g2') === true && dbG.listDreamSkips().join() === 'win-g2')
+  dbG.close()
+
+  // 工作区停用匹配（#28）：归一（斜杠/尾斜杠/大小写）+ 精确（非前缀）
+  check('ws-match: backslash+case+trailing slash normalize', workspaceDisabledMatch(['D:\\Repos\\FemO\\'], 'd:/repos/femo') === true)
+  check('ws-match: exact only (no prefix)', workspaceDisabledMatch(['d:/repos'], 'd:/repos/femo') === false)
+  check('ws-match: empty list never matches', workspaceDisabledMatch([], 'd:/repos') === false)
+  check('ws-norm: self-consistent', normalizeWorkspacePath('C:\\A\\B\\') === normalizeWorkspacePath('c:/a/b'))
+}
+
+// ── 工具门（#38）：读档/写档拒绝 + 整理轮豁免（判定在 host 闭包，桩测工具侧通道）──
+{
+  const wsT = mkdtempSync(join(tmpdir(), 'mm-toolgate-'))
+  const dbT = new MemoryDb(memoryDbPath(wsT))
+  setMemoryToolGate({
+    refuseRead: (ws, sid) => (sid === 'win-ro' ? '此窗口已停止读入记忆' : null),
+    refuseWrite: (ws, sid) => (sid === 'win-ro' && sid !== 'plugin-turn' ? '此窗口已停止写入记忆' : null),
+  })
+  // 直接构造 ToolRunContext 形状走真实工具的 execute：门在校验之前，读档命中时
+  // 不应看到「content 必填」这类后置报错。registerMemoryTools 从 lib 导入收集工具。
+  const mod = await import('./lib/index.js')
+  const registered = []
+  mod.registerMemoryTools((t) => registered.push(t), '.dsh-meow')
+  const byName = Object.fromEntries(registered.map((t) => [t.name, t]))
+  const exec = (sid) => ({ agent: { session: { header: { id: sid ?? 'win-normal', cwd: wsT } } } })
+  const searchErr = await byName.memory_search.execute({ query: 'x' }, exec('win-ro')).then(() => null, (e) => e)
+  check('toolgate: read refused on gated window', searchErr !== null && String(searchErr.message).includes('停止读入'))
+  const rememberErr = await byName.memory_remember.execute({ content: 'c', project: 'p', keywords: ['k'] }, exec('win-ro')).then(() => null, (e) => e)
+  check('toolgate: write refused on gated window', rememberErr !== null && String(rememberErr.message).includes('停止写入'))
+  const searchOk = await byName.memory_search.execute({ query: 'x' }, exec('win-normal')).then(() => true, (e) => (String(e.message).includes('停止') ? false : true))
+  check('toolgate: ungated window passes gate (search runs or unrelated error)', searchOk === true)
+  setMemoryToolGate(undefined)
+  const searchAfter = await byName.memory_search.execute({ query: 'x' }, exec('win-ro')).then(() => true, (e) => !String(e.message).includes('停止'))
+  check('toolgate: clearing gate restores pass', searchAfter === true)
+  dbT.close()
+  closeAllDbs() // 工具内部 getDb 的缓存连接一并关掉（Windows 文件锁）
+  rmSync(wsT, { recursive: true, force: true })
+}
 
 // ── dream v2 数据层：时间前缀 id / 新列 / status 检索语义 / windows ────────
 check('newId time-prefixed', /^[0-9a-z]{9}-/.test(newId()) && newId().length === 36)
@@ -207,6 +297,33 @@ check('check gate passes first', dbW.claimCheckGate(0) === true)
 check('check gate blocks within interval', dbW.claimCheckGate(86_400_000) === false)
 check('check gate passes after interval', dbW.claimCheckGate(0) === true)
 
+// ── 记忆库备份（issue #37 增量②）：VACUUM INTO 快照轮转 + mtime 增量判定 ──
+{
+  const wsBk = mkdtempSync(join(tmpdir(), 'mm-backup-'))
+  const dbBk = new MemoryDb(memoryDbPath(wsBk))
+  check('backup: fresh db without data', backupMemoryDb(wsBk) === true)
+  const fsBak = await import('node:fs')
+  check('backup: .bak exists after first run', fsBak.existsSync(memoryDbPath(wsBk) + '.bak'))
+  // 快照内容可开且含 schema：直接用 node:sqlite 打开 .bak 查 soul 表
+  const { DatabaseSync } = await import('node:sqlite')
+  const probe = new DatabaseSync(memoryDbPath(wsBk) + '.bak')
+  check('backup: snapshot has schema', probe.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='soul'`).get() !== undefined)
+  probe.close()
+  // 无新写入：mtime 不变 → 第二次跳过（mtime 粒度可能同毫秒，人为 sleep 5ms 保险）
+  await new Promise((r) => setTimeout(r, 5))
+  check('backup: unchanged db skipped (mtime)', backupMemoryDb(wsBk) === false)
+  // 新写入后再备份成功，且新数据在快照里
+  dbBk.insert({ level: 'fact', content: '备份前写入的记忆' })
+  await new Promise((r) => setTimeout(r, 5))
+  check('backup: after write runs again', backupMemoryDb(wsBk) === true)
+  const probe2 = new DatabaseSync(memoryDbPath(wsBk) + '.bak')
+  check('backup: snapshot contains new row', probe2.prepare('SELECT COUNT(*) AS n FROM fact').get().n === 1)
+  probe2.close()
+  dbBk.close()
+  closeAllDbs()
+  rmSync(wsBk, { recursive: true, force: true })
+}
+
 // v0.23.1：进程重启后 agent-missing 窗口从 persistence 恢复 agent → dream 自动触发（不需要人碰窗口）
 {
   const cfgR = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
@@ -261,6 +378,136 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   check('resume: not-found backed off (no retry within window)', resumeCalls4 === 1)
   dbR4.close()
   rmSync(wsR4, { recursive: true, force: true })
+}
+
+// ── issue #36：dream 失败处理——零进展中断不静默封存、连续上限才止损、turn-failed 即时处理 ──
+{
+  const wsF = mkdtempSync(join(tmpdir(), 'mm-dream-fail-'))
+  const dbF = getDb(wsF, '.dsh-meow')
+  const widF = 'win-fail-1'
+  dbF.touchWindow(widF, wsF, Date.now() - 4 * 3600_000)
+  dbF.insert({ level: 'fact', content: '失败窗口的记忆', project: 'dsh', source_session: widF, created_at: 100 })
+
+  // 失败计数：同 T 累加 / T 变化重计 / 显式清零
+  dbF.recordDreamFailure(widF, 1000)
+  check('recordDreamFailure accumulates per T', dbF.recordDreamFailure(widF, 1000) === 2)
+  check('recordDreamFailure resets on T change', dbF.recordDreamFailure(widF, 2000) === 1)
+  dbF.clearDreamFailure(widF)
+  check('clearDreamFailure resets count', dbF.recordDreamFailure(widF, 2000) === 1)
+  dbF.clearDreamFailure(widF)
+
+  // 零进展中断：释放待重试（旧 bug：一次中断就盖章，整窗记忆静默消失且永不重试）
+  dbF.claimDream(widF, 'o-f1', 1000, LEASE)
+  check('recover zero-progress releases (attempt 1)', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 &&
+    dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
+  dbF.claimDream(widF, 'o-f2', 1000, LEASE)
+  check('recover zero-progress releases (attempt 2)', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 &&
+    dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
+  // 第 3 次：达上限 → 封存止损（不再无限重试）
+  dbF.claimDream(widF, 'o-f3', 1000, LEASE)
+  const leaseF3 = dbF.getDreamLease(widF)
+  const retF3 = recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow')
+  console.log('DBG leaseT=', leaseF3?.T, 'ret=', retF3, 'meta=', JSON.stringify(dbF.db.prepare("SELECT key, value FROM dream_meta WHERE key LIKE 'dreamfail%' ORDER BY key").all()), 'last_dream=', dbF.getWindow(widF)?.last_dream_time)
+  check('recover zero-progress seals at cap', dbF.getWindow(widF)?.last_dream_time !== null && dbF.getDreamLease(widF) === null)
+  // 封存即收尾：计数清零（下一轮从 1 重计，不继承旧失败）
+  check('failure counter cleared after seal', dbF.recordDreamFailure(widF, 1000) === 1)
+  dbF.clearDreamFailure(widF)
+  dbF.releaseDream(widF)
+
+  // turn/end error 的即时处理：无租约 → none；有租约 → 释放；连续达上限 → 封存
+  const widF2 = 'win-fail-2'
+  dbF.touchWindow(widF2, wsF, Date.now() - 4 * 3600_000)
+  check('turn-failure without lease is none', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'none')
+  dbF.claimDream(widF2, 'o-t1', 1000, LEASE)
+  check('turn-failure releases active lease', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'released' && dbF.getDreamLease(widF2) === null)
+  dbF.claimDream(widF2, 'o-t2', 1000, LEASE)
+  check('turn-failure accumulates (attempt 2 released)', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'released')
+  dbF.claimDream(widF2, 'o-t3', 1000, LEASE)
+  check('turn-failure seals at cap', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'sealed' && dbF.getWindow(widF2)?.last_dream_time !== null)
+  dbF.close()
+  rmSync(wsF, { recursive: true, force: true })
+}
+
+// issue #36 根因：resume 组装 agentOptions（agentDefaultModel 回退源）；mock 未提供该
+// 服务且无会话日志时走裸 resume——旧测试路径行为逐字节不变（上面 v0.23.1 块即回归）。
+{
+  const cfgR2 = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
+  const wsS2 = mkdtempSync(join(tmpdir(), 'mm-resume-route-'))
+  const dbS2 = getDb(wsS2, '.dsh-meow')
+  const widS2 = 'win-route-1'
+  dbS2.touchWindow(widS2, wsS2, Date.now() - 4 * 3600_000)
+  dbS2.insert({ level: 'fact', content: '带路由恢复的记忆', project: 'dsh', source_session: widS2, created_at: 100 })
+  const resumedWith = []
+  const agentS2 = { session: { header: { id: widS2 } }, steer: () => {} }
+  const ctxS2 = {
+    get: (name) => name === 'agents'
+      ? { resume: async (opts) => { resumedWith.push(opts); return agentS2 } }
+      : name === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+        : undefined,
+  }
+  await resumeAndDream(ctxS2, widS2, wsS2, '.dsh-meow', undefined, cfgR2)
+  check('resume: agentOptions from default selection', resumedWith.length === 1 &&
+    resumedWith[0].resumeSessionId === widS2 &&
+    resumedWith[0].agentOptions?.provider === 'deepseek-official' && resumedWith[0].agentOptions?.model === 'deepseek-flash')
+  check('resume: dream started with route', dbS2.getDreamLease(widS2) !== null)
+  dbS2.close()
+  rmSync(wsS2, { recursive: true, force: true })
+}
+
+// ── issue #26：活配置——热字段 getter 化 + 引用相等缓存 + 检查 tick 活读 ──
+{
+  // liveConfigReader：thunk 语义回归（源函数引用恒定、返回值换新对象时 live 值必须
+  // 跟着变——#26 报告人 v1 踩坑：把函数本体当源，引用恒定 → 缓存永不失效）+
+  // 同源引用缓存（identity 稳定）+ 缺源回落出厂默认。
+  const box = { current: undefined }
+  const read = liveConfigReader({ enabled: true }, () => box.current, 0)
+  const r1 = read()
+  check('liveConfig: missing source → factory defaults', r1.hitTopK === 2 && r1.dream.enabled === true)
+  check('liveConfig: same source → cached identity', read() === r1)
+  box.current = { hitTopK: 5 }
+  const r2 = read()
+  check('liveConfig: new source object → re-resolved', r2 !== r1 && r2.hitTopK === 5)
+  check('liveConfig: stable ref again → cached', read() === r2)
+
+  // applyLiveConfig：resolved 热字段 getter 化——快照对象上的读取穿透到最新源；
+  // dream 视图引用稳定、属性活；注册期字段（projectDir）保持冻结。
+  // 接线对齐生产（applyLiveConfig(resolveConfig(merged), reader)）：传入对象必须是
+  // 独立于读取器缓存的快照（structuredClone），误传缓存对象会触发 defineLive 的
+  // 防御回退（见 index.ts 注释）。
+  const resolvedLive = applyLiveConfig(structuredClone(read()), read)
+  check('applyLiveConfig: hot key reads live', resolvedLive.hitTopK === 5)
+  box.current = { hitTopK: 7, dream: { enabled: false } }
+  check('applyLiveConfig: hot key follows source change', resolvedLive.hitTopK === 7)
+  const dreamView1 = resolvedLive.dream
+  check('applyLiveConfig: dream view reads live', resolvedLive.dream.enabled === false)
+  box.current = { dream: { enabled: true, checkMinutes: 9 } }
+  check('applyLiveConfig: dream view live after change', resolvedLive.dream.enabled === true && resolvedLive.dream.checkMinutes === 9)
+  check('applyLiveConfig: dream view reference stable', resolvedLive.dream === dreamView1)
+  box.current = { projectDir: '.other' }
+  check('applyLiveConfig: registration-time fields stay frozen', resolvedLive.projectDir === '.dsh-meow')
+
+  // dreamSweepTick：enabled=false / 抑制时段在任何 DB 操作（含 60s 检查门的 SQLite
+  // 往返）之前短路——用检查门 last_check 是否被写做可观测判定（去 #26 报告人指出的
+  // 观测盲点）；getter 抛错不炸 sweep 链。
+  const wsT = mkdtempSync(join(tmpdir(), 'mm-tick-'))
+  const dbT = getDb(wsT, '.dsh-meow')
+  const gateValue = () => dbT.db.prepare(`SELECT value FROM dream_meta WHERE key = 'last_check'`).get()?.value
+  const cfgOf = (over) => ({ enabled: true, idleMinutes: 180, suppressWindows: [], suppressLeadMinutes: 15, checkMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2, ...over })
+  const winIndexT = new Map([['win-tick', wsT]])
+  dreamSweepTick({}, cfgOf({}), '.dsh-meow', winIndexT)
+  const v1 = gateValue()
+  check('tick: enabled → check gate claimed', typeof v1 === 'number' && v1 > 0)
+  dreamSweepTick({}, cfgOf({ enabled: false }), '.dsh-meow', winIndexT)
+  check('tick: disabled short-circuits before gate', gateValue() === v1)
+  dreamSweepTick({}, cfgOf({ suppressWindows: [{ start: '00:00', end: '23:59' }] }), '.dsh-meow', winIndexT)
+  check('tick: suppressed short-circuits before gate', gateValue() === v1)
+  dreamSweepTick({}, cfgOf({}), '.dsh-meow', winIndexT)
+  check('tick: gate blocks re-entry within 60s', gateValue() === v1)
+  dreamSweepTick({}, () => { throw new Error('cfg getter boom') }, '.dsh-meow', winIndexT)
+  check('tick: throwing getter survives', gateValue() === v1)
+  dbT.close()
+  rmSync(wsT, { recursive: true, force: true })
 }
 
 // 递归 dream 修复（2026-09-05 猫猫拍板）：delegate fork 的子代理会话会进 windows 表，
@@ -722,8 +969,35 @@ function makeCtx(subagents) {
 
 const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
-check('seven tools registered', tools.length === 7 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
+check('eight tools registered', tools.length === 8 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_home']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
+
+// memory_home 工具：查询 / 非法 target 防误切 / 合法切换（走 switchHomeDir 真链路）
+{
+  const home = tools.find((t) => t.name === 'memory_home')
+  const saved = activeHomeDir()
+  const tmpH = mkdtempSync(join(tmpdir(), 'meow-home-tool-'))
+  const savedReal = activeHomeDir()
+
+  const r1 = await home.execute({})
+  check('memory_home: 查询模式返回当前目录与预设', String(r1.note).includes('当前全局数据目录') && String(r1.note).includes('dsh-storage'))
+
+  setActiveHomeDir(join(tmpH, 'from'))
+  const r2 = await home.execute({ target: 'not-a-legal-target' })
+  check('memory_home: 非法 target 防误切', String(r2.note).includes('无法识别') && activeHomeDir() === join(tmpH, 'from'))
+
+  mkdirSync(join(tmpH, 'from2'))
+  writeFileSync(join(tmpH, 'from2', 'seed.txt'), 'x')
+  setActiveHomeDir(join(tmpH, 'from2'))
+  const r3 = await home.execute({ target: join(tmpH, 'to-home') })
+  check('memory_home: 合法切换生效且留标记', String(r3.note).includes('已切换为') && existsSync(join(tmpH, 'to-home', 'home-dir.json')) && activeHomeDir() === join(tmpH, 'to-home'))
+
+  const r4 = await home.execute({ target: 'dsh-storage' })
+  check('memory_home: 预设标记解析并切换', typeof r4.note === 'string' && r4.note.length > 0)
+
+  setActiveHomeDir(savedReal)
+  rmSync(tmpH, { recursive: true, force: true })
+}
 
 // memory_dream 工具入口：子代理会话拒绝（与 /dream 命令守卫同语义——fork 播种父
 // 会话 turn，工具 schema 对子代理可见，误调在此拦下，不进 windows 表不留痕迹）。
@@ -1214,7 +1488,7 @@ const decisionA = await preStep(
 )
 check('pre-step inserts independent snapshot', decisionA.kind === 'enter' && decisionA.messages.length === 2 &&
   decisionA.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
-  decisionA.messages[0].source.kind === 'plugin' && decisionA.messages[0].source.plugin === 'meow-memory' &&
+  decisionA.messages[0].source.kind === 'plugin:meow-memory' &&
   decisionA.messages[0].source.form === 'snapshot' && decisionA.messages[0].source.sections.length === 2 &&
   decisionA.messages[0].source.sections[0].name === '__meta__' &&
   JSON.parse(decisionA.messages[0].source.sections[0].text).kind === 'initial' &&
@@ -1237,7 +1511,7 @@ check('snapshot is inserted before first user despite leading plugin notice',
   decisionNotif.kind === 'enter' &&
   decisionNotif.messages[0].content.length === 1 && // 通知消息原样保留
   decisionNotif.messages[0] === notifMsg &&
-  decisionNotif.messages[1].source.kind === 'plugin' &&
+  decisionNotif.messages[1].source.kind === 'plugin:meow-memory' &&
   decisionNotif.messages[1].source.form === 'snapshot' &&
   decisionNotif.messages[1].content[0].text.includes('===== 长期记忆 =====') &&
   !decisionNotif.messages[1].content[0].text.includes('可能相关的记忆，仅供参考：') &&
@@ -1294,7 +1568,7 @@ const decisionA3 = await preStep(
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }] }),
 )
 check('per-message hit inserts independent snapshot', decisionA3.messages.length === 2 &&
-  decisionA3.messages[0].source.kind === 'plugin' && decisionA3.messages[0].source.form === 'snapshot' &&
+  decisionA3.messages[0].source.kind === 'plugin:meow-memory' && decisionA3.messages[0].source.form === 'snapshot' &&
   decisionA3.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
   !decisionA3.messages[0].content[0].text.includes('本轮用户prompt：') &&
   decisionA3.messages[0].content[0].text.includes('测试关键词修正') &&
@@ -1320,7 +1594,7 @@ const dReinj = await preStep(
 )
 check('post-compaction reinjection injects snapshot + projects', dReinj.kind === 'enter' &&
   dReinj.messages.length === 2 &&
-  dReinj.messages[0].source.kind === 'plugin' && dReinj.messages[0].source.form === 'snapshot' &&
+  dReinj.messages[0].source.kind === 'plugin:meow-memory' && dReinj.messages[0].source.form === 'snapshot' &&
   dReinj.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   dReinj.messages[0].content[0].text.includes('【会话已压缩】') &&
   dReinj.messages[0].content[0].text.includes('【项目：femo】') &&
@@ -1382,7 +1656,7 @@ const dGuide1 = await guidePreStep(
   async () => ({ kind: 'enter', messages: [guideMsg] }),
 )
 check('welcome guide injected as independent notice when promptLang unset', dGuide1.messages.length === 2 &&
-  dGuide1.messages[0].source.kind === 'plugin' &&
+  dGuide1.messages[0].source.kind === 'plugin:meow-memory' &&
   dGuide1.messages[0].source.form === 'notice' &&
   typeof dGuide1.messages[0].source.summary === 'string' && dGuide1.messages[0].source.summary.length > 0 &&
   dGuide1.messages[0].source.memory === undefined &&
@@ -1725,7 +1999,63 @@ setPromptLang('zh')
 // ③ 未被 user 层覆盖的字段仍按 patch 层跑（user 层是字段级覆盖、不是整层替换）
 const sc3 = makeSettingsCtx({ promptLang: 'zh' })
 await apply(sc3.ctx, { enabled: true, projectDir: '.dsh-meow', hitTopK: 9 })
-check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 7, `got ${sc3.tools.length}`)
+check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 8, `got ${sc3.tools.length}`)
+
+// ── 0.1.7 宿主盲区补丁：describe 值冻结修正 + homeDirPresets 注入 + write 热切换 ──
+// 0.1.7 的 SettingsForms.write 只落盘从不重载 entry：describe 的 value 冻结在启动值、
+// user 层却新鲜——设置页 radio 因此停在旧位置（2026-09-25 实车分裂实证）。壳=describe
+// 现场重算 value=base⊕user + base 注入 homeDirPresets（不进 value，防 decode 失败）；
+// write 成功侧补 hotSwitchHomeDir（default=当前目录 → 幂等 no-op，链路不炸即可）。
+{
+  class FakeSettings017 {
+    constructor(rows) { this.rows = rows; this.wrote = null }
+    async write(ns, _change, _expected) { this.wrote = ns; return 'ok' }
+    describe() { return this.rows }
+  }
+  const rows017 = [{
+    ns: 'meow-memory', revision: 3, schema: {}, applies: 'live',
+    value: { enabled: true, projectDir: '.dsh-meow', homeDir: 'stale-frozen-at-boot' },
+    base: { enabled: true, projectDir: '.dsh-meow', homeDir: '' },
+    user: { homeDir: 'default' },
+  }, { ns: 'other-ns', revision: 1, value: { x: 1 }, base: {}, user: {} }]
+  const svc017 = new FakeSettings017(rows017)
+  const ctx017 = {
+    logger: { info: () => {}, warn: () => {}, error: console.error },
+    tools: { register: () => {} },
+    on: () => {},
+    effect: () => () => {},
+    get: (n) => (n === 'settings' ? svc017 : undefined),
+    // 真 cordis 会静默吞 inject 回调里的同步异常（0.1.7 上 compat 必抛 'neither'）；
+    // 裸 mock 不吞会炸测试进程——补齐同款语义。
+    inject: (_deps, cb) => { queueMicrotask(() => { try { cb({ settings: svc017, effect: ctx017.effect }) } catch { /* cordis 静默吞 */ } }) },
+  }
+  await apply(ctx017, { enabled: true, projectDir: '.dsh-meow' })
+  const proto017 = Object.getPrototypeOf(svc017)
+  check('0.1.7 describe/write 壳已装配', proto017.__meowValueRefresh === true && proto017.__meowWriteHook === true,
+    JSON.stringify({ v: proto017.__meowValueRefresh, w: proto017.__meowWriteHook }))
+  const meowRow = svc017.describe().find((r) => r.ns === 'meow-memory')
+  check('0.1.7 describe value 现场重算=base⊕user（不再冻结）',
+    meowRow.value.homeDir === 'default' && meowRow.value.projectDir === '.dsh-meow', JSON.stringify(meowRow.value))
+  check('0.1.7 homeDirPresets 注入 base、不进 value（value 过 schema decode）',
+    typeof meowRow.base.homeDirPresets === 'object' && meowRow.value.homeDirPresets === undefined,
+    JSON.stringify({ b: typeof meowRow.base.homeDirPresets, v: meowRow.value.homeDirPresets }))
+  check('0.1.7 非我方命名空间原样透传', svc017.describe()[1].base.homeDirPresets === undefined, '')
+  await svc017.write('meow-memory', () => ({}))
+  check('0.1.7 write 成功侧热切换链路不炸（default→当前目录 no-op）', svc017.wrote === 'meow-memory', '')
+  // 0.1.6 形状（installSection 在）绝不装壳——原生链路全在，包装反而多此一举
+  const svcLegacy = { installSection: (_o, _n, _s, _e, hooks) => { hooks.setSource(() => ({})); return () => {} } }
+  const ctxLegacy = {
+    logger: { info: () => {}, warn: () => {}, error: console.error },
+    tools: { register: () => {} },
+    on: () => {},
+    effect: () => () => {},
+    get: (n) => (n === 'settings' ? svcLegacy : undefined),
+    inject: (_deps, cb) => { queueMicrotask(() => cb({ settings: svcLegacy, effect: ctxLegacy.effect })) },
+  }
+  await apply(ctxLegacy, { enabled: true, projectDir: '.dsh-meow' })
+  check('0.1.6 原生链路不装壳（Object.prototype 不被污染）',
+    Object.getPrototypeOf(svcLegacy).__meowValueRefresh === undefined && Object.getPrototypeOf(svcLegacy).__meowWriteHook === undefined, '')
+}
 
 // disabled
 const { ctx: ctxOff, tools: toolsOff, handlers: handlersOff } = makeCtx()
@@ -1750,6 +2080,142 @@ rmSync(wsD, { recursive: true, force: true })
 rmSync(wsR, { recursive: true, force: true })
 rmSync(wsIcon, { recursive: true, force: true })
 rmSync(wsNoDb, { recursive: true, force: true })
+
+// ── issue #27：已删除的工作区目录不被 loadWindowIndex 复活 ──
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'meow-i27-'))
+  const wsLive = join(tmp, 'ws-live')
+  const wsDead = join(tmp, 'ws-dead')
+  mkdirSync(join(wsLive, '.dsh-meow'), { recursive: true })
+  // 存活工作区先建库（模拟真实使用过的状态）
+  getDb(wsLive, '.dsh-meow').close()
+  const indexFile = join(tmp, 'window-index.json')
+  writeFileSync(indexFile, JSON.stringify({ 's-live': wsLive, 's-dead': wsDead }))
+  loadWindowIndex('.dsh-meow', indexFile)
+  check('issue#27 存活工作区的索引恢复不受影响', existsSync(join(wsLive, '.dsh-meow', 'memory.db')))
+  check('issue#27 已删除的工作区目录不被复活', !existsSync(wsDead))
+  check('issue#27 存活工作区目录不被误删', existsSync(wsLive))
+  closeAllDbs()
+  rmSync(tmp, { recursive: true, force: true })
+}
+
+// ── 主目录日志清扫：48h 保留 + perf.log 轮转（白名单精确点名，绝不 glob）──
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'meow-sweep-'))
+  const stale = (Date.now() - 49 * 3600 * 1000) / 1000 // 超 48h 一小时
+  const fresh = (Date.now() - 1 * 3600 * 1000) / 1000
+  const mk = (name, mtimeSec, body = 'x') => {
+    writeFileSync(join(tmp, name), body)
+    utimesSync(join(tmp, name), mtimeSec, mtimeSec)
+  }
+  // 白名单：两个超期该删、两个新鲜该留
+  mk('perf.log', stale)
+  mk('apply-error.log', stale)
+  mk('settings-register-error.log', fresh)
+  mk('perf.log.old', fresh)
+  // 非白名单住户：就算超期也绝不能动（误删防线）
+  mk('window-index.json', stale, '{}')
+  mk('migrate-v0-state.json', stale, '{"migrated":true}')
+  mk('migrate-v0-state.json.bak-2026', stale, '{}')
+  mkdirSync(join(tmp, 'prompts'))
+
+  const r = sweepHomeLogs(tmp, Date.now())
+  check('sweep 超期白名单被删（perf.log）', !existsSync(join(tmp, 'perf.log')))
+  check('sweep 超期白名单被删（apply-error.log）', !existsSync(join(tmp, 'apply-error.log')))
+  check('sweep 新鲜白名单保留（settings-register-error.log）', existsSync(join(tmp, 'settings-register-error.log')))
+  check('sweep 新鲜白名单保留（perf.log.old）', existsSync(join(tmp, 'perf.log.old')))
+  check('sweep 非白名单超期也不碰（window-index.json）', existsSync(join(tmp, 'window-index.json')))
+  check('sweep 非白名单超期也不碰（migrate-v0-state.json 及 .bak）', existsSync(join(tmp, 'migrate-v0-state.json')) && existsSync(join(tmp, 'migrate-v0-state.json.bak-2026')))
+  check('sweep 非白名单不碰（prompts/ 目录）', existsSync(join(tmp, 'prompts')))
+  check('sweep 返回值记账（swept=2 rotated=false）', r.swept.length === 2 && r.swept.includes('perf.log') && r.swept.includes('apply-error.log') && !r.rotated)
+
+  // 轮转：新鲜 perf.log 超 5MB → 改名 .old（覆盖上一代）
+  const big = 'y'.repeat(5 * 1024 * 1024 + 1)
+  writeFileSync(join(tmp, 'perf.log'), big)
+  const r2 = sweepHomeLogs(tmp, Date.now())
+  check('sweep 轮转：超 5MB 的 perf.log 改名为 .old', r2.rotated && !existsSync(join(tmp, 'perf.log')) && existsSync(join(tmp, 'perf.log.old')))
+  check('sweep 轮转保一代：.old 内容正是刚轮转的大文件', readFileSync(join(tmp, 'perf.log.old'), 'utf8') === big)
+
+  // 幂等：无 perf.log 时轮转静默跳过不炸
+  const r3 = sweepHomeLogs(tmp, Date.now())
+  check('sweep 幂等：无 perf.log 时轮转静默跳过', !r3.rotated && !existsSync(join(tmp, 'perf.log')))
+
+  rmSync(tmp, { recursive: true, force: true })
+}
+
+// ── 全局目录：预设解析 + 迁移切换（home-dir.ts；红线=绝不删旧目录/绝不覆盖非空目标）──
+{
+  const savedReal = activeHomeDir()
+  const tmp = mkdtempSync(join(tmpdir(), 'meow-homedir-'))
+
+  // resolveHomeDir：预设/缺省/非法输入
+  check('resolveHomeDir: default 标记=平台默认目录', resolveHomeDir('default') === DEFAULT_HOME_DIR)
+  check('resolveHomeDir: 空/undefined 回落默认', resolveHomeDir('') === DEFAULT_HOME_DIR && resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
+  const savedEnv = process.env.DSH_HOME
+  process.env.DSH_HOME = join(tmp, 'dshhome')
+  check('resolveHomeDir: dsh-storage 预设=DSH_HOME/storages/meow-memory', resolveHomeDir('dsh-storage') === join(tmp, 'dshhome', 'storages', 'meow-memory'))
+  process.env.DSH_HOME = savedEnv
+  check('resolveHomeDir: plugin-root 预设=插件根/storage（绝对路径）', resolveHomeDir('plugin-root') === homeDirPresets()['plugin-root'] && resolve(resolveHomeDir('plugin-root')) === resolveHomeDir('plugin-root'))
+  check('resolveHomeDir: 相对路径非法回落默认', resolveHomeDir('relative/path') === DEFAULT_HOME_DIR)
+  check('resolveHomeDir: 用户主目录本身非法回落默认', resolveHomeDir(homedir()) === DEFAULT_HOME_DIR)
+  const customAbs = join(tmp, 'custom-home')
+  check('resolveHomeDir: 合法绝对路径原样通过', resolveHomeDir(customAbs) === resolve(customAbs))
+  const savedEnvHome = process.env.MEOW_MEMORY_HOME
+  process.env.MEOW_MEMORY_HOME = join(tmp, 'env-home')
+  check('resolveHomeDir: env 兜底生效（配置无值时）', resolveHomeDir(undefined) === join(tmp, 'env-home') && resolveHomeDir('') === join(tmp, 'env-home'))
+  if (savedEnvHome === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedEnvHome // 直接赋 undefined 会存成字符串 "undefined"
+  check('resolveHomeDir: env 还原后回落默认', resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
+
+  // switchHomeDir：same / 目标非空直接启用 / 同盘 rename 迁移
+  const from = join(tmp, 'from-home')
+  mkdirSync(from)
+  writeFileSync(join(from, 'perf.log'), 'old-perf')
+  writeFileSync(join(from, 'window-index.json'), '{}')
+  setActiveHomeDir(from)
+  let sw = switchHomeDir(from)
+  check('switch: 同目录不动', !sw.changed && sw.mode === 'same' && activeHomeDir() === from)
+
+  const busy = join(tmp, 'busy-home')
+  mkdirSync(busy)
+  writeFileSync(join(busy, 'keep.txt'), 'user-data')
+  sw = switchHomeDir(busy)
+  check('switch: 目标非空直接启用、绝不覆盖', sw.changed && sw.mode === 'reused-nonempty' && !sw.migrated && readFileSync(join(busy, 'keep.txt'), 'utf8') === 'user-data')
+  check('switch: 目标非空时不搬旧内容', !existsSync(join(busy, 'perf.log')))
+
+  const moved = join(tmp, 'moved-home')
+  setActiveHomeDir(from) // 上一步 reused 切换已把状态口拨到 busy；本场景从 from-home 起迁
+  sw = switchHomeDir(moved)
+  check('switch: 空目标走迁移（同盘 rename）', sw.changed && sw.migrated && sw.mode === 'rename')
+  check('switch: rename 后旧目录不复存在（同盘移动语义）', !existsSync(from))
+  check('switch: 内容完整落到新目录', readFileSync(join(moved, 'perf.log'), 'utf8') === 'old-perf')
+  check('switch: 落 home-dir.json 标记', existsSync(join(moved, 'home-dir.json')) && JSON.parse(readFileSync(join(moved, 'home-dir.json'), 'utf8')).migratedFrom === from)
+  check('switch: 状态口已切到新目录', activeHomeDir() === moved)
+
+  // 目标为空壳目录：同盘时实现会拆壳后 rename（单盘环境测不到跨盘 copy 分支——
+  // 该分支只有 EXDEV/句柄占用触发）；断言迁移成功+内容落位即可。
+  const copyFrom = join(tmp, 'copy-from')
+  const copyTo = join(tmp, 'copy-to')
+  mkdirSync(copyFrom)
+  writeFileSync(join(copyFrom, 'apply-error.log'), 'err')
+  mkdirSync(copyTo)
+  setActiveHomeDir(copyFrom)
+  sw = switchHomeDir(copyTo)
+  check('switch: 空壳目标迁移成功', sw.changed && sw.migrated && (sw.mode === 'rename' || sw.mode === 'copy'))
+  check('switch: 内容落位+标记在', readFileSync(join(copyTo, 'apply-error.log'), 'utf8') === 'err' && existsSync(join(copyTo, 'home-dir.json')))
+  // 「绝不自动删旧目录」红线在 copy 场景成立（rename 场景旧目录消失=OS 移动语义）；
+  // 单测以「目标非空绝不覆盖」锁同一条红线：旧目录内容原样保留（上方 keep.txt 断言）。
+
+  // failed：目标是一个文件（不是目录）
+  const fileTarget = join(tmp, 'not-a-dir')
+  writeFileSync(fileTarget, 'x')
+  setActiveHomeDir(copyTo)
+  sw = switchHomeDir(fileTarget)
+  check('switch: 目标是文件→失败留原地', !sw.changed && sw.mode === 'failed' && sw.error !== undefined && activeHomeDir() === copyTo)
+
+  setActiveHomeDir(savedReal)
+  rmSync(tmp, { recursive: true, force: true })
+}
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

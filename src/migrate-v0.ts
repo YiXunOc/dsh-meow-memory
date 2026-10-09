@@ -86,7 +86,7 @@ function scanFrames(buf: Buffer): Frame[] {
 }
 
 /** 逐帧解压整个容器，返回拼接明文（等价 zstd CLI -d -c）。 */
-function decompressAllFrames(buf: Buffer): Buffer {
+export function decompressAllFrames(buf: Buffer): Buffer {
   const frames = scanFrames(buf)
   const parts: Buffer[] = []
   for (const f of frames) parts.push(zstdDecompressSync(buf.subarray(f.start, f.end)))

@@ -14,7 +14,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fillTemplate, getPromptLang, keyedValue } from './prompt-loader.js'
@@ -237,7 +237,10 @@ export class MemoryDb {
     )`)
     this.db.exec(`CREATE TABLE IF NOT EXISTS dream_skip (
       session_id TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      skip_dream INTEGER NOT NULL DEFAULT 1,
+      skip_inject INTEGER NOT NULL DEFAULT 0,
+      skip_write INTEGER NOT NULL DEFAULT 0
     )`)
     this.upgrade()
   }
@@ -285,12 +288,31 @@ export class MemoryDb {
     if (wCols.has('dream_pending')) {
       this.db.exec(`UPDATE windows SET dream_owner = 'legacy-pending', dream_started_at = 0, dream_progress_at = 0, dream_group_idx = 0, dream_T = last_event_time WHERE dream_pending = 1 AND dream_owner IS NULL`)
     }
+    // dream_skip 表：v0.30.0 起升级为「记忆参与门控」（issue #38）——原有「跳过 dream」
+    // 语义显式化为 skip_dream 列，新增 skip_inject / skip_write。老库补列：存量行的
+    // 语义就是「跳过 dream」（旧行仅在该语义下产生），skip_dream 补默认 1 正确。
+    const sCols = new Set(
+      (this.db.prepare('PRAGMA table_info(dream_skip)').all() as Array<{ name: string }>).map((c) => c.name),
+    )
+    for (const [col, ddl] of [
+      ['skip_dream', 'INTEGER NOT NULL DEFAULT 1'],
+      ['skip_inject', 'INTEGER NOT NULL DEFAULT 0'],
+      ['skip_write', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) {
+      if (!sCols.has(col)) this.db.exec(`ALTER TABLE dream_skip ADD COLUMN ${col} ${ddl}`)
+    }
   }
 
   /** 新库（memories 全空）判定：迁移只在库刚创建时执行一次。 */
   isFresh(): boolean {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM soul').get() as { n: number }
     return row.n === 0
+  }
+
+  /** VACUUM INTO 一致性快照到目标路径（#37 可选备份；目标已存在会抛，调用方先轮转）。
+   *  WAL 下安全：快照含 WAL 内容，读连接一致性由 SQLite 保证。 */
+  vacuumInto(target: string): void {
+    this.db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`)
   }
 
   insert(row: { level: Level; content: string } & Partial<MemoryRow>): MemoryRow {
@@ -380,8 +402,21 @@ export class MemoryDb {
     if (patch.project !== undefined && level === 'topic') push('project', patch.project)
     if (sets.length === 0) return false
     push('updated_at', Date.now()) // 记忆时间戳 = 最后更新时间（任何 update 都刷新）
-    const where = id.length < 36 ? 'id LIKE ?' : 'id = ?'
-    const res = this.db.prepare(`UPDATE ${level} SET ${sets.join(', ')} WHERE ${where}`).run(...args, id.length < 36 ? `${id}%` : id)
+    // 短 id = 模型截断输出（findById/update 共享的前缀匹配语义）。前缀 LIKE 可能命中
+    // 多行——歧义更新会静默改掉一批无关注记（#23 复盘顺带加固）：先解析，唯一命中
+    // 升级为全 id 精确更新（语义不变，不再走 LIKE），多行命中拒绝（warn 留痕），
+    // 零命中与旧行为一致返回 false。
+    let targetId = id
+    if (id.length < 36) {
+      const matches = this.db.prepare(`SELECT id FROM ${level} WHERE id LIKE ?`).all(`${id}%`) as Array<{ id: string }>
+      if (matches.length > 1) {
+        console.warn(`[meow-memory] update 拒绝歧义短 id：${level} 前缀 "${id}" 命中 ${matches.length} 行，请用完整 id`)
+        return false
+      }
+      if (matches.length === 0) return false
+      targetId = matches[0].id
+    }
+    const res = this.db.prepare(`UPDATE ${level} SET ${sets.join(', ')} WHERE id = ?`).run(...args, targetId)
     return res.changes > 0
   }
 
@@ -505,6 +540,8 @@ export class MemoryDb {
     this.db
       .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL, last_dream_time = ? WHERE session_id = ?`)
       .run(time, sessionId)
+    // dream 收尾（完成/中止/封存）= 本轮尝试周期结束：失败计数清零（issue #36）。
+    this.clearDreamFailure(sessionId)
   }
 
   /** dream 失败释放：只清租约，**不动 last_dream_time**——窗口保持「待整理」状态，
@@ -516,6 +553,36 @@ export class MemoryDb {
     this.db
       .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL WHERE session_id = ?`)
       .run(sessionId)
+  }
+
+  // ── dream 失败计数（issue #36）──────────────────────────────────────────────
+  // 存 dream_meta（KV，跨实例/重启共享）：`dreamfail_c:<sid>` = 连续失败次数、
+  // `dreamfail_t:<sid>` = 计数对应的整理范围 T。T 变了（窗口有新活动 → 新一轮整理
+  // 范围不同）自动从 1 重计；dream 收尾（finishDream）清零。与 releaseDream 的
+  // 「失败不封存、可重试」语义配套：失败只释放，连续达上限（DREAM_MAX_ATTEMPTS，
+  // dream.ts）才封存止损——既不让一次故障静默吞掉整窗记忆，也不让持续性故障
+  // 变成无限重试烧 token。
+
+  /** 记一次 dream 失败，返回当前连续失败次数（同 T 累加，T 变化重计）。 */
+  recordDreamFailure(sessionId: string, T: number): number {
+    const prevT = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_t:${sessionId}`) as { value: number | null } | undefined
+    const prevC = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_c:${sessionId}`) as { value: number | null } | undefined
+    const count = prevT !== undefined && prevT.value === T && prevC !== undefined && typeof prevC.value === 'number' && prevC.value >= 1
+      ? prevC.value + 1
+      : 1
+    this.db
+      .prepare(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(`dreamfail_t:${sessionId}`, T)
+    this.db
+      .prepare(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(`dreamfail_c:${sessionId}`, count)
+    return count
+  }
+
+  /** 清 dream 失败计数（finishDream 收尾时自动调用；一般无需手动调）。 */
+  clearDreamFailure(sessionId: string): void {
+    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_t:${sessionId}`)
+    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_c:${sessionId}`)
   }
 
   /** 是否有进行中/未收尾的 dream（租约存在，无论是否过期）。 */
@@ -565,28 +632,56 @@ export class MemoryDb {
       .run(Date.now(), sessionId).changes === 1
   }
 
-  // ── dream_skip 跳过表（v0.16.0：用户按会话跳过自动 dream；侧边栏菜单 toggle） ──
+  // ── dream_skip 门控表（v0.16.0 跳过 dream → v0.30.0 升级为「记忆参与」三档门控，#38）──
+  // 一行 = 一个窗口的门控状态：skip_dream（跳过整理：自动 dream + 自动反思）、
+  // skip_inject（停止读入：首轮快照/命中/重注入/search/read 等读入口）、skip_write
+  // （停止写入：普通轮的 remember/update；整理轮写入跟随整理档）。三档全 false 删行。
 
-  /** 设置/清除某会话的跳过标记。skip=true 写入，false 删除。 */
-  setDreamSkip(sessionId: string, skip: boolean): void {
-    if (skip) {
-      this.db
-        .prepare(`INSERT INTO dream_skip (session_id, created_at) VALUES (?, ?)
-          ON CONFLICT(session_id) DO UPDATE SET created_at = excluded.created_at`)
-        .run(sessionId, Date.now())
-    } else {
+  /** 读某窗口的门控状态（无行 = 三档全开）。 */
+  getMemoryScope(sessionId: string): { dream: boolean; inject: boolean; write: boolean } {
+    const row = this.db
+      .prepare(`SELECT skip_dream, skip_inject, skip_write FROM dream_skip WHERE session_id = ?`)
+      .get(sessionId) as { skip_dream: number; skip_inject: number; skip_write: number } | undefined
+    if (row === undefined) return { dream: false, inject: false, write: false }
+    return { dream: row.skip_dream === 1, inject: row.skip_inject === 1, write: row.skip_write === 1 }
+  }
+
+  /** 设置某窗口某档的开关；三档全 false 时删行（表只存有门槛的窗口）。
+   *  新行显式插 0（DDL 的 DEFAULT 1 只服务于老行迁移——老行语义就是 dream 跳过）。 */
+  setMemoryScopeField(sessionId: string, field: 'dream' | 'inject' | 'write', value: boolean): void {
+    const col = field === 'dream' ? 'skip_dream' : field === 'inject' ? 'skip_inject' : 'skip_write'
+    this.db
+      .prepare(`INSERT INTO dream_skip (session_id, created_at, skip_dream, skip_inject, skip_write) VALUES (?, ?, 0, 0, 0) ON CONFLICT(session_id) DO NOTHING`)
+      .run(sessionId, Date.now())
+    this.db.prepare(`UPDATE dream_skip SET ${col} = ? WHERE session_id = ?`).run(value ? 1 : 0, sessionId)
+    const scope = this.getMemoryScope(sessionId)
+    if (!scope.dream && !scope.inject && !scope.write) {
       this.db.prepare(`DELETE FROM dream_skip WHERE session_id = ?`).run(sessionId)
     }
   }
 
-  /** 该会话是否被跳过自动 dream（只挡定时器自动触发；手动触发不受限）。 */
-  isDreamSkipped(sessionId: string): boolean {
-    return this.db.prepare(`SELECT 1 FROM dream_skip WHERE session_id = ?`).get(sessionId) !== undefined
+  /** 全部门控状态（client 全量对账用）。 */
+  listMemoryScopes(): Array<{ session_id: string; dream: boolean; inject: boolean; write: boolean }> {
+    const rows = this.db
+      .prepare(`SELECT session_id, skip_dream, skip_inject, skip_write FROM dream_skip
+        WHERE skip_dream = 1 OR skip_inject = 1 OR skip_write = 1`)
+      .all() as Array<{ session_id: string; skip_dream: number; skip_inject: number; skip_write: number }>
+    return rows.map((r) => ({ session_id: r.session_id, dream: r.skip_dream === 1, inject: r.skip_inject === 1, write: r.skip_write === 1 }))
   }
 
-  /** 全部被跳过的会话 id（client 全量对账用）。 */
+  /** 设置/清除某会话的跳过标记（v0.30.0 起委派门控表 dream 档；旧调用点/测试兼容）。 */
+  setDreamSkip(sessionId: string, skip: boolean): void {
+    this.setMemoryScopeField(sessionId, 'dream', skip)
+  }
+
+  /** 该会话是否被跳过自动 dream（只挡定时器自动触发；手动触发不受限）。 */
+  isDreamSkipped(sessionId: string): boolean {
+    return this.getMemoryScope(sessionId).dream
+  }
+
+  /** 全部被跳过的会话 id（client 全量对账用，v0.30.0 起为 dream 档子集）。 */
   listDreamSkips(): string[] {
-    return (this.db.prepare(`SELECT session_id FROM dream_skip`).all() as Array<{ session_id: string }>).map((r) => r.session_id)
+    return this.listMemoryScopes().filter((s) => s.dream).map((s) => s.session_id)
   }
 
   // ── 全局检查门（dream 定时器防叠加） ─────────────────────────────────────
@@ -688,6 +783,28 @@ export function getDb(workspace: string, dir = '.dsh-meow'): MemoryDb {
 export function closeAllDbs(): void {
   for (const db of dbCache.values()) db.close()
   dbCache.clear()
+}
+
+/** 记忆库备份（issue #37 增量②）：memory.db → memory.db.bak 单文件轮转。
+ *  mtime 判增量（bak 不旧于数据即跳过）——WAL 模式下写入落在 -wal 文件、主库
+ *  mtime 可能不动，所以取 db 与 -wal 的较新者。VACUUM INTO 不能覆盖已存在文件 →
+ *  先写 .tmp 再 rename 原子替换。失败返回 false（备份是兜底措施，绝不影响主流程）。 */
+export function backupMemoryDb(workspace: string, dir = '.dsh-meow'): boolean {
+  try {
+    const dbPath = memoryDbPath(workspace, dir)
+    if (!existsSync(dbPath)) return false
+    const bakPath = `${dbPath}.bak`
+    let dataMtime = statSync(dbPath).mtimeMs
+    const walPath = `${dbPath}-wal`
+    if (existsSync(walPath)) dataMtime = Math.max(dataMtime, statSync(walPath).mtimeMs)
+    if (existsSync(bakPath) && statSync(bakPath).mtimeMs >= dataMtime) return false
+    const tmp = `${bakPath}.tmp`
+    getDb(workspace, dir).vacuumInto(tmp)
+    renameSync(tmp, bakPath)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** dream 子 agent 的 DB 定位通道：子 agent 会话可能无 cwd，dream 运行时临时挂载。 */

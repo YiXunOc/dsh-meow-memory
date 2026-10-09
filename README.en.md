@@ -1,7 +1,7 @@
 # meow-memory 🐱📝
 
-| [中文](README.md) | [English](README.en.md) | [MIT License](LICENSE) |
-| :---: | :---: | :---: |
+| [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
+| :---: | :---: | :---: | :---: |
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
@@ -214,11 +214,19 @@ The reflection turn and each dream group always run in the main window (steer) �
 
 To run memory work on a different (cheaper) model: with `delegate.model` set, every LLM request issued during reflection/dream turns gets its provider/model overridden via dsh's `agent/request` waterfall, and the main model takes over again once the turn ends — normal conversation and tool rounds are untouched. The implementation is stateless: each request is judged by whether the current turn carries a reflection/dream directive marker, so user aborts, crashes, and hot reloads can never leave a stuck "overridden" state.
 
+### UI language: follows the DSH locale (v0.27.0)
+
+The plugin's own UI copy (fold bars, delegate bubbles, session menu item, settings page) goes through a separate **UI copy layer** that follows DSH's Settings → General → Language: **中文 / English / Português (Brasil)** ship built in, and a switch applies immediately (the settings label re-registers per the official contract; plain DOM nodes are refreshed through a replay registry).
+
+It is a different layer from `promptLang` (model-facing copy) and the two do not interfere: the UI can follow the shell while injected prompts keep following `promptLang`. On old hosts (no locale service) it degrades to the browser language plus the built-in dictionaries, ending at `zh` — unchanged for a Chinese-reading user on a Chinese browser, and now pulling English (the point of the change) for one whose browser asks for it.
+
+Adding a community UI language: one dictionary file plus one line in `SUPPORTED_UI_LOCALES` (no UI code changes). See [`src/i18n/README.md`](src/i18n/README.md).
+
 ### promptLang: prompt & retrieval language (important)
 
 `promptLang` decides two things: ① the language of injected/reflection/dream prompts; ② the language of tool descriptions. It also shapes the language the model writes memory entries in — keywords are extracted in the entry's language, so **go with your chat language**.
 
-**Set it explicitly on first use**: `'zh'` (default) or `'en'` (built-in English language pack). If your chat language differs from your UI language, **go with your chat language**.
+**Set it explicitly on first use**: `'zh'` (default), `'en'` (built-in English pack) or `'pt-br'` (built-in Brazilian Portuguese pack). The value *is* the subdirectory name and is matched **verbatim**: a name that does not exist under `src/prompts/` (e.g. `pt`) raises nothing and silently falls back to the Chinese pack.
 
 On the retrieval side: the BM25 tokenizer is language-independent since v0.20.0 (category routing) — a language mismatch between queries and stored entries no longer degrades recall; `en` additionally enables English normalization (stopword filter + Porter stemmer), so inflected queries still hit stored entries (`tokenizers` matches `tokenizer`).
 
@@ -271,6 +279,7 @@ Thanks to every contributor who made meow-memory better:
 - **[daveycodez](https://github.com/daveycodez)** — English language pack & tokenizer ([PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6), shipped in v0.22.0)
 - **[chenmzh](https://github.com/chenmzh)** — isolated memory injections into independent plugin snapshot messages, fixing session title pollution ([PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10))
 - **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — dual-version Session events compatibility for dsh 0.1.2-alpha.4 ([PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11))
+- **[coutogilson](https://github.com/coutogilson)** — Brazilian Portuguese prompt pack (`src/prompts/pt-br/`) and the UI copy layer that follows the DSH locale
 
 ## 📄 License
 

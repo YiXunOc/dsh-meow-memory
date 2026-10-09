@@ -1,9 +1,10 @@
 /**
  * Build script: TS source -> deployable package.
  *
- * Two artifacts:
+ * Three artifacts:
  *  - lib/index.js — host loader entry (exports["."] / main), loaded by the
  *    dsh Node process.
+ *  - lib/migration-worker.js — independent background migration entry.
  *  - lib/client.js — browser bundle in ModuleLoader.load format (the web
  *    shell's client module loader; see @deepseek-ai/dsh-client-modules).
  *

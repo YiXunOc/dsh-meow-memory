@@ -15,7 +15,7 @@ const { outputFiles } = await build({
 })
 const code = new TextDecoder().decode(outputFiles[0].contents)
 const modUrl = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups, formatInjectionClock, memoryTurnNumbers } = await import(modUrl)
+const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups, formatInjectionClock, memoryTurnNumbers, setUiLocaleForTest } = await import(modUrl)
 
 // ---- mock 快照 ----
 function turnLoc(turn) {
@@ -244,12 +244,29 @@ console.log('=== 5. tool-result 形态计数 ===')
 console.log('=== 6. foldLabel 文案 ===')
 {
   const base = { id: 'x', variant: 'reflect', keys: [], rememberCount: 0, updateCount: 0, status: 'done' }
+  // 文案经 i18n 层（跟随 DSH 语言设置）：先锁 zh 保持历史断言，再补 en / pt-br。
+  setUiLocaleForTest('zh')
   check('新增记忆 3 条', foldLabel({ ...base, rememberCount: 3 }, false) === '▸ 记忆反思 · 新增记忆 3 条')
   check('无需记忆', foldLabel(base, false) === '▸ 记忆反思 · 无需记忆')
   check('running', foldLabel({ ...base, status: 'running' }, false) === '▸ 记忆反思进行中…')
   check('已更新 2 条', foldLabel({ ...base, updateCount: 2 }, false) === '▸ 记忆反思 · 已更新 2 条')
   check('dream 新增', foldLabel({ ...base, variant: 'dream', rememberCount: 1 }, true) === '▾ 记忆梦境任务 · 新增记忆 1 条')
   check('中断', foldLabel({ ...base, status: 'interrupted' }, false) === '▸ 记忆反思已中断')
+  // issue #20（用户拍板 2026-09-20）：dream 运行中横条要提示"插话会拼进本轮"；
+  // 反思运行中不带提示。文案同样走 i18n 层。
+  check('dream running 提示插话', foldLabel({ ...base, variant: 'dream', status: 'running' }, false) === '▸ 记忆梦境任务进行中…（插话会拼进本轮）')
+  check('reflect running 无提示', foldLabel({ ...base, status: 'running' }, false) === '▸ 记忆反思进行中…')
+  setUiLocaleForTest('en')
+  check('en 新增记忆 3 条', foldLabel({ ...base, rememberCount: 3 }, false) === '▸ Memory reflection · 3 memories added')
+  check('en 无需记忆', foldLabel(base, false) === '▸ Memory reflection · nothing to save')
+  check('en dream 中断', foldLabel({ ...base, variant: 'dream', status: 'interrupted' }, false) === '▸ Memory dream task interrupted')
+  check('en dream running 提示插话', foldLabel({ ...base, variant: 'dream', status: 'running' }, false) === '▸ Memory dream task in progress… (your message joins this turn)')
+  check('en reflect running 无提示', foldLabel({ ...base, status: 'running' }, false) === '▸ Memory reflection in progress…')
+  setUiLocaleForTest('pt-br')
+  check('pt-br 新增记忆 3 条', foldLabel({ ...base, rememberCount: 3 }, false) === '▸ Reflexão de memória · 3 memórias adicionadas')
+  check('pt-br running', foldLabel({ ...base, status: 'running' }, false) === '▸ Reflexão de memória em andamento…')
+  check('pt-br dream running 提示插话', foldLabel({ ...base, variant: 'dream', status: 'running' }, false) === '▸ Consolidação ociosa de memória (dream) em andamento… (mensagem entra nesta rodada)')
+  setUiLocaleForTest('zh')
 }
 
 // ---- 7. 并行 tool-call 各自成节点（反思轮真实形态） ----
@@ -363,10 +380,40 @@ console.log('=== 10. formatInjectionClock ===')
 {
   const now = new Date(2026, 7, 23, 15, 0).getTime() // 2026-08-23 15:00 本地
   const mk = (y, mo, d, h, mi) => new Date(y, mo, d, h, mi).getTime()
+  setUiLocaleForTest('zh')
   check('同天 → HH:mm', formatInjectionClock(mk(2026, 7, 23, 9, 5), now) === '09:05')
   check('同天 → HH:mm 补零', formatInjectionClock(mk(2026, 7, 23, 15, 0), now) === '15:00')
   check('今年非今天 → M月D日 HH:mm', formatInjectionClock(mk(2026, 0, 2, 8, 30), now) === '1月2日 08:30')
   check('跨年 → Y年M月D日 HH:mm', formatInjectionClock(mk(2025, 11, 31, 23, 59), now) === '2025年12月31日 23:59')
+  setUiLocaleForTest('en')
+  check('en 今年非今天 → M/D HH:mm', formatInjectionClock(mk(2026, 0, 2, 8, 30), now) === '1/2 08:30')
+  check('en 跨年 → Y/M/D HH:mm', formatInjectionClock(mk(2025, 11, 31, 23, 59), now) === '2025/12/31 23:59')
+  setUiLocaleForTest('pt-br')
+  check('pt-br 今年非今天 → D/M HH:mm', formatInjectionClock(mk(2026, 0, 2, 8, 30), now) === '2/1 08:30')
+  check('pt-br 跨年 → D/M/Y HH:mm', formatInjectionClock(mk(2025, 11, 31, 23, 59), now) === '31/12/2025 23:59')
+  setUiLocaleForTest('zh')
+}
+
+// ---- 11. 生产者 source 形态：当前形态与退役形态必须同判 ----
+// dsh 0.1.7 起新写入用 plugin:meow-memory（v4 拒绝退役的 plugin kind），
+// 历史会话经迁移器改写后也是同一形态；两种形态都必须被识别，否则读旧会话会丢折叠。
+console.log('=== 11. source 形态兼容 ===')
+{
+  const mk = (source) => {
+    const nodes = new Map([
+      ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(1), source)],
+      ['asst-1', assistantNode('asst-1', turnLoc(1), 'settled')],
+      ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(1), data: { turn: 1 } }],
+    ])
+    return snapshot(['ctx-1', 'asst-1', 'tail-1'], nodes, (t) => t === 1 ? ['ctx-1', 'asst-1', 'tail-1'] : [])
+  }
+  const current = computeFoldGroups(mk({ kind: 'plugin:meow-memory' }))
+  const retired = computeFoldGroups(mk({ kind: 'plugin', plugin: 'meow-memory' }))
+  check('当前形态（plugin:meow-memory）识别为反思轮', current.length === 1 && current[0].variant === 'reflect')
+  check('退役形态（plugin + 插件名）识别为反思轮', retired.length === 1 && retired[0].variant === 'reflect')
+  check('两种形态折叠结果一致', JSON.stringify(current) === JSON.stringify(retired))
+  check('别的插件的 source 不误判', computeFoldGroups(mk({ kind: 'plugin', plugin: 'other-plugin' })).length === 0)
+  check('无关 kind 不误判', computeFoldGroups(mk({ kind: 'user' })).length === 0)
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)

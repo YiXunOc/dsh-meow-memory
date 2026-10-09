@@ -17,7 +17,7 @@ async function bundleSrc(entry) {
   return import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
 }
 
-const { computeDelegateNotices, delegateNoticeLabel, delegateNoticeLabelFor, setDreamStatesForTest, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } = await bundleSrc('src/client-delegate-notice.ts')
+const { computeDelegateNotices, delegateNoticeLabel, delegateNoticeLabelFor, setDreamStatesForTest, setUiLocaleForTest, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } = await bundleSrc('src/client-delegate-notice.ts')
 const { computeFoldGroups, computeInjectionGroups } = await bundleSrc('src/client-fold.ts')
 
 // ---- mock 快照（同 client-fold.mjs 模式） ----
@@ -207,12 +207,22 @@ console.log('=== 7. 畸形节点防护 ===')
 // ---- 8. 文案（含状态映射） ----
 console.log('=== 8. delegateNoticeLabelFor 文案 ===')
 {
+  // 文案经 i18n 层（跟随 DSH 语言设置）：先锁 zh 保持历史断言，再补 en / pt-br。
+  setUiLocaleForTest('zh')
   check('reflect 进行中', delegateNoticeLabelFor('reflect', true) === '▸ 记忆反思任务进行中……')
   check('reflect 已完成', delegateNoticeLabelFor('reflect', false) === '▸ 记忆反思任务已完成。')
   check('dream 进行中', delegateNoticeLabelFor('dream', true) === '▸ 梦境记忆整理任务进行中……')
   check('dream 已完成', delegateNoticeLabelFor('dream', false) === '▸ 梦境记忆整理任务已完成。')
   check('reflect-done 恒已完成', delegateNoticeLabelFor('reflect-done', true) === '▸ 记忆反思任务已完成。')
   check('对象入口直通', delegateNoticeLabel({ id: 'x', variant: 'dream', running: true }) === '▸ 梦境记忆整理任务进行中……')
+  setUiLocaleForTest('en')
+  check('en reflect 进行中', delegateNoticeLabelFor('reflect', true) === '▸ Memory reflection task in progress…')
+  check('en dream 已完成', delegateNoticeLabelFor('dream', false) === '▸ Memory dream task completed.')
+  check('en dream 已中断', delegateNoticeLabelFor('dream', true, true) === '▸ Memory dream task interrupted; retrying automatically later.')
+  setUiLocaleForTest('pt-br')
+  check('pt-br reflect 进行中', delegateNoticeLabelFor('reflect', true) === '▸ Tarefa de reflexão de memória em andamento…')
+  check('pt-br dream 已完成', delegateNoticeLabelFor('dream', false) === '▸ Tarefa de consolidação ociosa de memória concluída.')
+  setUiLocaleForTest('zh')
 }
 
 // ---- 9. marker 常量与 host 端 delegate.ts 逐字一致（复制常量的对账断言） ----
