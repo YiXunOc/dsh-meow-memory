@@ -193,6 +193,16 @@ dsh plugin --profile web remove meow-memory
 
 自定义 / 社区语言包：prompt 文案是数据文件（`src/prompts/`），一门语言一个子目录，改文件即生效、无需改代码——详见 [`src/prompts/README.md`](src/prompts/README.md)（含贡献指南与 `npm run check-lang` 自查）。实例级自定义：`<home>/.dsh-meow/prompts/<lang>/` 下放同名槽位文件即可覆盖（可只覆盖部分）。
 
+### 历史会话后台迁移
+
+插件会在启动完成 5 秒后通过独立 Worker Thread 迁移旧版会话中的 `source.memory`，不会在 Host 主线程扫描、解压或改写历史文件。状态和日志按当前 `DSH_HOME` 隔离：
+
+- 检查点：`$DSH_HOME/meow-memory/migrations/source-memory-v2.json`
+- 日志：`$DSH_HOME/meow-memory/logs/migration.log`
+- 原文件备份：`$DSH_HOME/pre-migrate-backup/`
+
+迁移按文件保存检查点；损坏文件不会阻止其他文件，正在变化的活动会话会延后而不会被覆盖。可在输入框使用 `/memory_migration status` 查看进度、`/memory_migration retry` 重试失败/延后文件、`/memory_migration pause` 在当前文件结束后暂停。
+
 ## 🧠 工作原理
 
 ```
@@ -214,8 +224,8 @@ dsh plugin --profile web remove meow-memory
 
 ```sh
 npm install
-npm run build          # esbuild 打包 → lib/index.js（自包含）
-npm run test           # 228 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run build          # esbuild 打包 host/client/迁移 Worker
+npm run test           # 主逻辑、客户端、后台迁移与 tgz 制品测试
 ```
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace 中，不在本包的 `node_modules` 里。

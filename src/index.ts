@@ -29,7 +29,6 @@ import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
-import { ensureV0SessionsMigrated } from './migrate-v0.js'
 
 import {
   abortDream,
@@ -48,6 +47,7 @@ import {
 } from './dream.js'
 import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPending, isReinjectPending, markAccessed, markReinjectPending, markSearched, readProjectQueried, readSeen, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
+import { migrationCommandDefinition, SessionMigrationCoordinator } from './migration-coordinator.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { registerMemoryTools } from './tools.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
@@ -583,15 +583,13 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   setPromptLang(resolved.promptLang ?? 'zh')
   applyCount++
   perf(`apply #${applyCount} pid=${process.pid}`)
-  loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
+  loadWindowIndex() // 恢复窗口索引（热重载/重启后旧窗口不失联）
 
-  // v0 会话一次性迁移（issue #13）：标记未迁移时体检全部会话并把 source.memory 搬进
-  // sections.__meta__，完成后置位 .dsh-meow/migrate-v0-state.json，此后启动直接跳过。
-  // fire-and-forget：绝不阻塞 dsh 启动；单文件失败只记日志（用户拍板 2026-09-10）。
-  void ensureV0SessionsMigrated(resolved.projectDir, (m) => ctx.logger.info(m)).catch((e: unknown) => {
-    ctx.logger.warn(`meow-memory: migrate-v0 failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
-  })
   perf(`window-index restored ${windowIndex.size} windows`)
+
+  // 历史会话迁移只在独立 Worker 中执行。Host 端仅安排延迟启动；定时器 unref，
+  // apply 不等待扫描/解压/改写，插件 dispose 时由 coordinator 收拢线程与迁移锁。
+  const sessionMigration = new SessionMigrationCoordinator({ logger: ctx.logger })
 
   // 工具注册 + disposer 收集：热重载/重启时旧 fiber 的工具必须注销，
   // 否则新 apply 重复注册同名工具会抛异常 → apply 中断 → 工具/手册/pre-step 全失效
@@ -1127,14 +1125,21 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   let commandTimer = 0
   const tryRegisterDreamCommand = (attempt: number): void => {
     const commands = (ctx as { get?: (name: string) => unknown }).get?.('commands') as
-      | { register?: (definition: unknown) => unknown }
+      | { register?: (definition: unknown) => () => void }
       | undefined
     if (commands !== undefined && typeof commands.register === 'function') {
+      const registerCommand = commands.register
       try {
-        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))))
+        commandDisposers.push(ctx.effect(() => registerCommand.call(commands, dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))))
         ctx.logger.info('meow-memory: /dream user command registered')
       } catch (e) {
         ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      try {
+        commandDisposers.push(ctx.effect(() => registerCommand.call(commands, migrationCommandDefinition(sessionMigration))))
+        ctx.logger.info('meow-memory: /memory_migration user command registered')
+      } catch (e) {
+        ctx.logger.warn(`meow-memory: /memory_migration 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
       }
       return
     }
@@ -1146,39 +1151,46 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
   tryRegisterDreamCommand(0)
 
-  ctx.on('dispose', () => {
-    for (const dispose of toolDisposers) {
-      try {
-        dispose()
-      } catch {
-        /* 注销失败不阻塞 */
-      }
-    }
-    for (const dispose of routeDisposers) {
-      try {
-        dispose()
-      } catch {
-        /* 注销失败不阻塞 */
-      }
-    }
-    for (const dispose of commandDisposers) {
-      try {
-        dispose()
-      } catch {
-        /* 注销失败不阻塞 */
-      }
-    }
-    clearTimeout(routeTimer)
-    clearTimeout(commandTimer)
-    stopDream()
-    disposeDreamHeartbeats() // 热重载不残留 dream 租约心跳定时器
-    broadcast.dispose()
+  // Cordis 会等待 effect 的 async disposer；热重载必须等 Worker 在文件边界停止并释放锁。
+  ctx.effect(() => async () => {
     try {
-      closeAllDbs()
-    } catch {
-      /* 关库失败不阻塞清理链 */
+      for (const dispose of toolDisposers) {
+        try {
+          dispose()
+        } catch {
+          /* 注销失败不阻塞 */
+        }
+      }
+      for (const dispose of routeDisposers) {
+        try {
+          dispose()
+        } catch {
+          /* 注销失败不阻塞 */
+        }
+      }
+      for (const dispose of commandDisposers) {
+        try {
+          dispose()
+        } catch {
+          /* 注销失败不阻塞 */
+        }
+      }
+      clearTimeout(routeTimer)
+      clearTimeout(commandTimer)
+      await sessionMigration.dispose()
+    } finally {
+      stopDream()
+      disposeDreamHeartbeats() // 热重载不残留 dream 租约心跳定时器
+      broadcast.dispose()
+      try {
+        closeAllDbs()
+      } catch {
+        /* 关库失败不阻塞清理链 */
+      }
     }
   })
+  // 注册完清理入口后再安排任务；apply 后续若抛错，不会遗留无人管理的 Worker timer。
+  sessionMigration.schedule()
 }
 
 /** 统一 JSON 响应（路由用）。 */
@@ -1257,30 +1269,17 @@ async function resolveWorkspaceForSession(ctx: Context, sessionId: string): Prom
 const windowIndex = new Map<string, string>()
 const WINDOW_INDEX_FILE = join(homedir(), '.dsh-meow', 'window-index.json')
 
-/** apply 时恢复窗口索引：①文件（上次落盘）→ workspace 集合；②每个已知 workspace
- *  的 windows 表（DB 持久化，含 reload 前全部窗口）补全——旧窗口（reload 后无新
- *  事件、文件里没有）也能恢复，不会从 dream 检查中失联。 */
-function loadWindowIndex(dir = '.dsh-meow'): void {
-  const workspaces = new Set<string>()
+/** apply 时只恢复窗口索引文件；数据库在启动阶段不得被打开或升级。 */
+function loadWindowIndex(): void {
   try {
     const merged = JSON.parse(readFileSync(WINDOW_INDEX_FILE, 'utf8')) as Record<string, unknown>
     for (const [sid, ws] of Object.entries(merged)) {
       if (typeof ws === 'string' && ws.length > 0) {
         windowIndex.set(sid, ws)
-        workspaces.add(ws)
       }
     }
   } catch {
     /* 无文件/损坏 */
-  }
-  for (const ws of workspaces) {
-    try {
-      for (const w of getDb(ws, dir).listWindows()) {
-        if (typeof w.workspace === 'string' && w.workspace.length > 0) windowIndex.set(w.session_id, w.workspace)
-      }
-    } catch {
-      /* 该 workspace 库不可用：跳过 */
-    }
   }
 }
 
@@ -1307,6 +1306,9 @@ export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, 
 export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateLegacy } from './migrate.js'
+export { SessionMigrationCoordinator, migrationCommandDefinition } from './migration-coordinator.js'
+export { runSessionMigration, processSessionFile, listSessionFiles } from './migrate-v0.js'
+export { readSessionMigrationState, sessionMigrationPaths, tryAcquireSessionMigrationLock } from './migration-state.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'

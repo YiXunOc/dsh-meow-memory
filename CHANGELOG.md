@@ -32,6 +32,25 @@
 
 - 主套件 **423**（新增 #24 的 8 条、#19 的 3 条、#21 的 3 条回归断言，均验证过**在修复前会失败**：#24 旧代码直接抛 issue 原文那句错、#19 旧代码同 turn 排了 3 条、#21 旧代码 user 层 `enabled: false` 被无视照常注册 7 个工具）。`test.mjs` 新增 `makeSettingsCtx`，补齐「异步 inject + settings」的真形状（旧 mock 没有 inject/settings，异常被 try/catch 吞掉，这正是 #21 长期没被测到的原因）。
 
+## v0.26.2 (2026-09-12)
+
+### 历史会话迁移：完整后台 Worker 与断点续跑
+
+- 在 `apply()` 完成后延迟 5 秒启动独立 Worker Thread；Host 主线程不扫描、不解压、不重写历史会话，大量历史文件不再阻塞启动或事件循环。
+- 迁移状态按当前 `DSH_HOME` 隔离到 `$DSH_HOME/meow-memory/migrations/source-memory-v2.json`，以相对路径记录逐文件 identity、结果、尝试次数和错误；每处理一个文件原子落检查点，中断后只重试失败、延后或发生变化的文件。
+- 增加非阻塞单实例锁；活 PID 或无法证明归属的锁不会被抢占，仅回收可证明 PID 已退出的 stale lock，释放时校验 owner id。
+- 文件处理前和原子替换前复核 `size + mtimeMs`。处理中发生变化的活动会话标记为 deferred，保留原文件；损坏或拒绝迁移的单个文件标记 failed，不阻止后续文件。
+- Worker 支持文件边界 pause/stop，插件热重载通过 Cordis async effect disposer 等待线程退出并释放锁；新增 `/memory_migration status|retry|pause` 控制入口。
+- `lib/migration-worker.js` 作为独立产物进入 npm 包；测试覆盖真实多帧 zstd、header 独立帧、检查点续跑、并发锁、stale lock、失败隔离、活动文件保护、不同 `DSH_HOME`、Worker 暂停/清理、1000 文件启动公平性及 tgz 解包执行。
+
+## v0.26.1
+
+### 启动稳定性：历史维护移出启动关键路径
+
+- 移除 `apply()` 中的 v0 会话全量迁移。旧会话扫描、zstd 解压、备份和重写不再阻塞 DSH Host 启动。
+- `loadWindowIndex()` 启动时只读取窗口索引 JSON，不再逐个打开或升级历史工作区的 SQLite 数据库，避免数据库锁把多个工作区的等待时间串行累加。
+- 迁移器源码暂时保留，后续通过独立 Worker 或手动迁移流程执行；本版本优先保证旧 Profile 可以启动。（完整后台迁移已在 v0.26.2 交付。）
+
 ## v0.26.0 (2026-09-10)
 
 ### 反思/梦境任务独立成轮（dsh 0.1.5 工作汇报被折叠的根治）

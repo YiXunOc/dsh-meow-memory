@@ -13,50 +13,30 @@
  *  - 写：帧1 = header 行（含尾 \n）单独成帧（保持 assertZstdHeaderFrame 通过），
  *        帧2 = 全部事件行拼接单独成帧（dsh 的 encodeMaterialization 同构）；
  *        每帧带 checksum（ZSTD_c_checksumFlag，与 dsh CHECKSUM_OPTIONS 一致）；
- *  - 幂等/备份/原子替换/置位门槛与 v1 相同；置位条件加严：
- *    filesMigrated===0 && errors===0 才置 migrated=true，否则留待下次启动重试。
+ *  - 幂等/备份/原子替换由逐文件检查点保证；处理前与替换前复核 identity，
+ *    活动文件 deferred，损坏文件 failed，后续 Worker run 从检查点继续。
  */
+import { randomUUID } from 'node:crypto'
 import { zstdCompressSync, zstdDecompressSync, constants } from 'node:zlib'
-import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync } from 'node:fs'
-import { join, relative, dirname } from 'node:path'
-import { homedir } from 'node:os'
+import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync, lstatSync, linkSync } from 'node:fs'
+import { dirname, join, relative, sep } from 'node:path'
+import {
+  emptySessionMigrationState,
+  migrationTotals,
+  readSessionMigrationState,
+  writeSessionMigrationState,
+  type SessionFileIdentity,
+  type SessionMigrationFileState,
+  type SessionMigrationState,
+} from './migration-state.js'
 
 const PLUGIN = 'meow-memory'
 const META_SECTION_NAME = '__meta__'
 const PLUGIN_MARKER = `"plugin":"${PLUGIN}"`
 const MEMORY_KEY = '"memory":'
 const SECTIONS_KEY = '"sections":['
-const STATE_FILE = 'migrate-v0-state.json'
 const ZSTD_MAGIC = 0xfd2fb528 // 4247762216 LE
 const CHECKSUM_OPTIONS = { params: { [constants.ZSTD_c_checksumFlag]: 1 } }
-
-interface MigrateState { migrated?: boolean; migratedAt?: string; files?: number; lines?: number }
-export interface MigrateReport {
-  ran: boolean
-  reason?: string
-  scanned?: number
-  filesMigrated?: number
-  linesMigrated?: number
-  errors?: Array<{ file: string; error: string }>
-}
-
-function statePath(projectDir: string): string {
-  return join(homedir(), projectDir || '.dsh-meow', STATE_FILE)
-}
-
-export function readMigrateState(projectDir: string): MigrateState {
-  try {
-    return JSON.parse(readFileSync(statePath(projectDir), 'utf8')) as MigrateState
-  } catch {
-    return {}
-  }
-}
-
-function writeMigrateState(projectDir: string, state: MigrateState): void {
-  const p = statePath(projectDir)
-  mkdirSync(dirname(p), { recursive: true })
-  writeFileSync(p, JSON.stringify(state, null, 1), 'utf8')
-}
 
 /* ---------------- frame scanning（同 dsh scanZstdFrames 的边界定位语义） ---------------- */
 
@@ -259,23 +239,35 @@ function migrateLine(line: string): { line: string; changed: number; note?: stri
 
 /* ---------------- 文件枚举与帧级处理 ---------------- */
 
-function listSessionFiles(home: string): string[] {
+export function listSessionFiles(home: string): string[] {
   const files: string[] = []
   for (const rootName of ['sessions', 'archived-sessions']) {
     const root = join(home, rootName)
-    if (!existsSync(root)) continue
-    for (const proj of readdirSync(root)) {
-      const projDir = join(root, proj)
-      let st
-      try { st = statSync(projDir) } catch { continue }
-      if (!st.isDirectory()) continue
-      for (const sid of readdirSync(projDir)) {
-        const f = join(projDir, sid, 'session.jsonl.zstd')
-        if (existsSync(f)) files.push(f)
+    try {
+      if (!lstatSync(root).isDirectory()) continue
+    } catch {
+      continue
+    }
+    let projects
+    try { projects = readdirSync(root, { withFileTypes: true }) } catch { continue }
+    for (const project of projects) {
+      // Session roots are owned directories. Do not follow user-created links outside DSH_HOME.
+      if (!project.isDirectory()) continue
+      const projectDir = join(root, project.name)
+      let sessions
+      try { sessions = readdirSync(projectDir, { withFileTypes: true }) } catch { continue }
+      for (const session of sessions) {
+        if (!session.isDirectory()) continue
+        const file = join(projectDir, session.name, 'session.jsonl.zstd')
+        try {
+          if (lstatSync(file).isFile()) files.push(file)
+        } catch {
+          // A disappearing or unreadable entry is retried on a later run.
+        }
       }
     }
   }
-  return files
+  return files.sort()
 }
 
 function backupPathFor(home: string, file: string): string {
@@ -284,33 +276,111 @@ function backupPathFor(home: string, file: string): string {
   return join(home, 'pre-migrate-backup', rel)
 }
 
-function processFile(home: string, file: string, log: (m: string) => void): { migrated: number; note?: string } {
+function ensureOriginalBackup(home: string, file: string, raw: Buffer): void {
+  const backup = backupPathFor(home, file)
+  mkdirSync(dirname(backup), { recursive: true })
+  if (existsSync(backup)) {
+    // A prior complete backup is intentionally immutable. Validate its physical
+    // zstd structure so a crash-truncated legacy backup cannot bless a rewrite.
+    decompressAllFrames(readFileSync(backup))
+    return
+  }
+
+  // Publish only a fully written inode. Hard-link installation is an atomic
+  // no-replace operation; filesystems without hard links use rename under the
+  // migration's single-instance lock.
+  const temporary = `${backup}.tmp-${process.pid}-${randomUUID()}`
+  try {
+    writeFileSync(temporary, raw, { flag: 'wx', mode: 0o600 })
+    try {
+      linkSync(temporary, backup)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code
+      if (code === 'EEXIST') return
+      if (code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM' && code !== 'EXDEV') throw error
+    }
+    if (!existsSync(backup)) renameSync(temporary, backup)
+  } finally {
+    rmSync(temporary, { force: true })
+  }
+}
+
+function identityOf(file: string): SessionFileIdentity {
+  const stat = statSync(file)
+  return { size: stat.size, mtimeMs: stat.mtimeMs }
+}
+
+function sameIdentity(left: SessionFileIdentity, right: SessionFileIdentity): boolean {
+  return left.size === right.size && left.mtimeMs === right.mtimeMs
+}
+
+function relativeSessionPath(home: string, file: string): string {
+  return relative(home, file).split(sep).join('/')
+}
+
+export interface ProcessSessionFileOptions {
+  expectedIdentity: SessionFileIdentity
+  log?: (message: string) => void
+  /** Test/instrumentation hook run immediately before the final identity check. */
+  beforeReplace?: (file: string) => void
+}
+
+export interface ProcessSessionFileResult {
+  status: 'done' | 'deferred'
+  result?: 'unchanged' | 'migrated'
+  migratedLines: number
+  identity: SessionFileIdentity
+  error?: string
+}
+
+/** Process one session without throwing for normal activity races. */
+export function processSessionFile(
+  home: string,
+  file: string,
+  options: ProcessSessionFileOptions,
+): ProcessSessionFileResult {
+  const initialIdentity = identityOf(file)
+  if (!sameIdentity(initialIdentity, options.expectedIdentity)) {
+    return {
+      status: 'deferred',
+      migratedLines: 0,
+      identity: initialIdentity,
+      error: 'file changed before processing',
+    }
+  }
+
   const rawBuf = readFileSync(file)
   // 快速预筛：直接在压缩字节里找不了明文——逐帧解压第一帧（header）太便宜但事件在后面帧；
   // 折中：先全帧解压（与 zstd CLI 等价），无标记即刻返回。
   const raw = decompressAllFrames(rawBuf).toString('utf8')
-  if (!raw.includes(PLUGIN_MARKER) || !raw.includes(MEMORY_KEY)) return { migrated: 0 }
+  if (!raw.includes(PLUGIN_MARKER) || !raw.includes(MEMORY_KEY)) {
+    const finalIdentity = identityOf(file)
+    if (!sameIdentity(initialIdentity, finalIdentity)) {
+      return { status: 'deferred', migratedLines: 0, identity: finalIdentity, error: 'file changed while processing' }
+    }
+    return { status: 'done', result: 'unchanged', migratedLines: 0, identity: finalIdentity }
+  }
 
   const lines = raw.split('\n')
   let changed = 0
-  const notes: string[] = []
   const outLines = lines.map((l) => {
     if (!l.includes(PLUGIN_MARKER) || !l.includes(MEMORY_KEY)) return l
-    try {
-      const r = migrateLine(l)
-      if (r.note) notes.push(r.note)
-      if (r.changed > 0) { changed += r.changed; return r.line }
-      return l
-    } catch (e) {
-      notes.push('line-error: ' + (e instanceof Error ? e.message : String(e)))
-      return l
+    const result = migrateLine(l)
+    if (result.note !== undefined) throw new Error(`refused session line: ${result.note}`)
+    if (result.changed > 0) {
+      changed += result.changed
+      return result.line
     }
+    return l
   })
-  if (changed === 0) return { migrated: 0, note: notes.join(';') }
-
-  const backup = backupPathFor(home, file)
-  mkdirSync(dirname(backup), { recursive: true })
-  if (!existsSync(backup)) copyFileSync(file, backup)
+  if (changed === 0) {
+    const finalIdentity = identityOf(file)
+    if (!sameIdentity(initialIdentity, finalIdentity)) {
+      return { status: 'deferred', migratedLines: 0, identity: finalIdentity, error: 'file changed while processing' }
+    }
+    return { status: 'done', result: 'unchanged', migratedLines: 0, identity: finalIdentity }
+  }
 
   // 帧级重编码（dsh encodeMaterialization 同构）：帧1 = header 行（独立、含尾\n），帧2 = 事件体
   // 明文行结构：lines[0] 必为 header 行（含尾随空元素——split 产物）。重建时保留原始行集合，
@@ -322,53 +392,169 @@ function processFile(home: string, file: string, log: (m: string) => void): { mi
   if (bodyText.length > 0) frames.push(compressFrame(Buffer.from(bodyText, 'utf8')))
   const outBuf = Buffer.concat(frames)
 
-  const tmpOut = file + '.migrated.tmp.zst'
-  writeFileSync(tmpOut, outBuf)
-  renameSync(tmpOut, file)
-  log(`migrated ${changed} line(s) in ${file}`)
-  return { migrated: changed }
+  const tmpOut = `${file}.migrated-${process.pid}-${randomUUID()}.tmp.zst`
+  try {
+    writeFileSync(tmpOut, outBuf, { flag: 'wx' })
+    options.beforeReplace?.(file)
+    const beforeReplaceIdentity = identityOf(file)
+    if (!sameIdentity(initialIdentity, beforeReplaceIdentity)) {
+      return {
+        status: 'deferred',
+        migratedLines: 0,
+        identity: beforeReplaceIdentity,
+        error: 'file changed before atomic replacement',
+      }
+    }
+
+    ensureOriginalBackup(home, file, rawBuf)
+
+    // Recheck after the backup write as it can take long enough for an active session to append.
+    const afterBackupIdentity = identityOf(file)
+    if (!sameIdentity(initialIdentity, afterBackupIdentity)) {
+      return {
+        status: 'deferred',
+        migratedLines: 0,
+        identity: afterBackupIdentity,
+        error: 'file changed before atomic replacement',
+      }
+    }
+    renameSync(tmpOut, file)
+  } finally {
+    rmSync(tmpOut, { force: true })
+  }
+
+  const migratedIdentity = identityOf(file)
+  options.log?.(`migrated ${changed} line(s) in ${file}`)
+  return { status: 'done', result: 'migrated', migratedLines: changed, identity: migratedIdentity }
 }
 
 /* ---------------- 入口 ---------------- */
 
-export async function ensureV0SessionsMigrated(projectDir: string, log: (m: string) => void): Promise<MigrateReport> {
-  const state = readMigrateState(projectDir)
-  if (state.migrated === true) return { ran: false, reason: 'already-migrated' }
-  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
-  if (!existsSync(home)) {
-    log('meow-memory migrate-v0: DSH_HOME not found, skip')
-    return { ran: false, reason: 'no-home' }
-  }
-  const report: MigrateReport = { ran: true, scanned: 0, filesMigrated: 0, linesMigrated: 0, errors: [] }
-  let files: string[]
-  try {
-    files = listSessionFiles(home)
-  } catch (e) {
-    return { ran: false, reason: 'list-failed: ' + (e instanceof Error ? e.message : String(e)) }
-  }
-  report.scanned = files.length
-  for (const f of files) {
-    try {
-      const r = processFile(home, f, log)
-      if (r.migrated > 0) {
-        report.filesMigrated = (report.filesMigrated ?? 0) + 1
-        report.linesMigrated = (report.linesMigrated ?? 0) + r.migrated
-      }
-    } catch (e) {
-      report.errors!.push({ file: f, error: e instanceof Error ? e.message : String(e) })
+export type SessionMigrationStopReason = 'pause' | 'stop'
+
+export interface RunSessionMigrationOptions {
+  shouldStop?: () => SessionMigrationStopReason | false
+  onProgress?: (state: SessionMigrationState, file: SessionMigrationFileState) => void
+  log?: (message: string) => void
+  beforeReplace?: (file: string) => void
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function checkpoint(
+  dshHome: string,
+  state: SessionMigrationState,
+  discovered: number,
+  status: SessionMigrationState['status'] = state.status,
+): void {
+  state.status = status
+  state.updatedAt = new Date().toISOString()
+  state.totals = migrationTotals(state.files, discovered)
+  writeSessionMigrationState(dshHome, state)
+}
+
+/** Run one resumable migration pass. Heavy work belongs in a Worker Thread. */
+export async function runSessionMigration(
+  dshHome: string,
+  options: RunSessionMigrationOptions = {},
+): Promise<SessionMigrationState> {
+  const home = join(dshHome)
+  const runId = randomUUID()
+  const startedAt = new Date().toISOString()
+  const state = readSessionMigrationState(home) ?? emptySessionMigrationState(home)
+  const files = listSessionFiles(home)
+  const discoveredKeys = new Set(files.map(file => relativeSessionPath(home, file)))
+
+  state.files = Object.fromEntries(Object.entries(state.files).filter(([key]) => discoveredKeys.has(key)))
+  state.runId = runId
+  state.startedAt = startedAt
+  delete state.completedAt
+  checkpoint(home, state, files.length, 'running')
+
+  options.log?.(`migration ${runId} started; discovered=${files.length}`)
+  for (const file of files) {
+    const stopReason = options.shouldStop?.() ?? false
+    if (stopReason !== false) {
+      checkpoint(home, state, files.length, 'paused')
+      options.log?.(`migration ${runId} ${stopReason === 'pause' ? 'paused' : 'stopped'} at a file boundary`)
+      return state
     }
+
+    const relativePath = relativeSessionPath(home, file)
+    let discoveredIdentity: SessionFileIdentity
+    try {
+      discoveredIdentity = identityOf(file)
+    } catch (error) {
+      const now = new Date().toISOString()
+      const previous = state.files[relativePath]
+      const entry: SessionMigrationFileState = {
+        relativePath,
+        identity: previous?.identity ?? { size: 0, mtimeMs: 0 },
+        status: 'failed',
+        migratedLines: 0,
+        attempts: (previous?.attempts ?? 0) + 1,
+        error: errorMessage(error),
+        updatedAt: now,
+      }
+      state.files[relativePath] = entry
+      checkpoint(home, state, files.length)
+      options.onProgress?.(state, entry)
+      await new Promise<void>(resolve => setImmediate(resolve))
+      continue
+    }
+
+    const previous = state.files[relativePath]
+    if (previous?.status === 'done' && sameIdentity(previous.identity, discoveredIdentity)) continue
+
+    const attempts = (previous?.attempts ?? 0) + 1
+    let entry: SessionMigrationFileState
+    try {
+      const result = processSessionFile(home, file, {
+        expectedIdentity: discoveredIdentity,
+        log: options.log,
+        beforeReplace: options.beforeReplace,
+      })
+      entry = {
+        relativePath,
+        identity: result.identity,
+        status: result.status,
+        ...(result.result === undefined ? {} : { result: result.result }),
+        migratedLines: result.migratedLines,
+        attempts,
+        ...(result.error === undefined ? {} : { error: result.error }),
+        updatedAt: new Date().toISOString(),
+      }
+    } catch (error) {
+      let currentIdentity = discoveredIdentity
+      try { currentIdentity = identityOf(file) } catch { /* retain discovered identity */ }
+      entry = {
+        relativePath,
+        identity: currentIdentity,
+        status: 'failed',
+        migratedLines: 0,
+        attempts,
+        error: errorMessage(error),
+        updatedAt: new Date().toISOString(),
+      }
+      options.log?.(`failed ${relativePath}: ${entry.error ?? 'unknown error'}`)
+    }
+
+    state.files[relativePath] = entry
+    checkpoint(home, state, files.length)
+    options.onProgress?.(state, entry)
+    // Let the Worker receive pause/stop messages between files.
+    await new Promise<void>(resolve => setImmediate(resolve))
   }
-  // 置位门槛：全部干净（无迁移对象 OR 全成功且零错误）才置 true；有错误 -> 不置位，下次启动重试
-  if ((report.errors?.length ?? 0) === 0) {
-    writeMigrateState(projectDir, {
-      migrated: true,
-      migratedAt: new Date().toISOString(),
-      files: report.filesMigrated,
-      lines: report.linesMigrated,
-    })
-  } else {
-    log(`meow-memory migrate-v0: ${report.errors!.length} file(s) failed; NOT setting migrated flag (will retry next boot)`)
-  }
-  log(`meow-memory migrate-v0: done. scanned=${report.scanned} filesMigrated=${report.filesMigrated} linesMigrated=${report.linesMigrated} errors=${report.errors!.length}`)
-  return report
+
+  state.completedAt = new Date().toISOString()
+  const totals = migrationTotals(state.files, files.length)
+  checkpoint(home, state, files.length, totals.failed === 0 && totals.deferred === 0 ? 'completed' : 'completed-with-errors')
+  options.log?.(
+    `migration ${runId} finished; status=${state.status} discovered=${state.totals.discovered} `
+    + `done=${state.totals.done} migratedFiles=${state.totals.migratedFiles} `
+    + `failed=${state.totals.failed} deferred=${state.totals.deferred}`,
+  )
+  return state
 }

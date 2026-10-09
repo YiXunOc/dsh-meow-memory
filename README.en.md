@@ -224,6 +224,16 @@ On the retrieval side: the BM25 tokenizer is language-independent since v0.20.0 
 
 Language packs are data files (one directory per language under `src/prompts/`, hot-read at runtime — no code changes needed). See [`src/prompts/README.md`](src/prompts/README.md) for the contributor guide and `npm run check-lang`. Instance-level overrides: drop same-named slot files into `<home>/.dsh-meow/prompts/<lang>/` (partial overrides welcome).
 
+### Background migration of historical sessions
+
+Five seconds after startup completes, the plugin migrates legacy `source.memory` fields in a dedicated Worker Thread. The Host thread never scans, decompresses, or rewrites historical session files. State and logs are isolated to the active `DSH_HOME`:
+
+- checkpoint: `$DSH_HOME/meow-memory/migrations/source-memory-v2.json`
+- log: `$DSH_HOME/meow-memory/logs/migration.log`
+- original-file backups: `$DSH_HOME/pre-migrate-backup/`
+
+Progress is checkpointed per file. A corrupt file does not block the rest, and an active session whose identity changes is deferred instead of overwritten. Use `/memory_migration status` to inspect progress, `/memory_migration retry` to retry failed/deferred files, and `/memory_migration pause` to stop at the next file boundary.
+
 ## 🧠 How it works
 
 ```
@@ -245,8 +255,8 @@ independent snapshot message    seen ids recorded
 
 ```sh
 npm install
-npm run build          # esbuild bundle → lib/index.js (self-contained)
-npm run test           # 228 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run build          # esbuild bundles host/client/migration worker
+npm run test           # core, client, background-migration, and packed-artifact tests
 ```
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's

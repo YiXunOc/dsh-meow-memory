@@ -696,6 +696,11 @@ check('no memory → null', buildInjection(db4, ws4, 'x', 'hi') === null)
 
 // ═══════════════════════ 部分 2：apply 级 ═══════════════════════
 
+const originalDshHome = process.env.DSH_HOME
+const migrationTestHome = mkdtempSync(join(tmpdir(), 'mm-apply-migration-'))
+process.env.DSH_HOME = migrationTestHome
+const allEffectDisposers = []
+
 function makeCtx(subagents) {
   const tools = []
   const handlers = {}
@@ -704,7 +709,12 @@ function makeCtx(subagents) {
     logger: { info: () => {}, warn: () => {}, error: console.error },
     tools: { register: (t) => tools.push(t) },
     on: (name, fn) => { handlers[name] = fn },
-    effect: (fn) => { effects.push(fn); return () => {} },
+    effect: (fn) => {
+      const disposer = fn()
+      effects.push(disposer)
+      if (typeof disposer === 'function') allEffectDisposers.push(disposer)
+      return disposer
+    },
     subagents: subagents ?? { start: () => { throw new Error('subagents not expected in tests') } },
   }
   return { ctx, tools, handlers, effects }
@@ -1648,7 +1658,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   rmSync(wsEmpty, { recursive: true, force: true })
 }
 
-// 注册接线：commands 服务就绪时 apply 自动注册 /dream（ctx.effect 包装，disposer 收集）
+// 注册接线：commands 服务就绪时 apply 自动注册 /dream + /memory_migration。
 {
   const registeredC = []
   const disposers = []
@@ -1658,12 +1668,22 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
     : undefined
   ctxCmd.effect = (fn) => {
     const d = fn()
-    if (typeof d === 'function') disposers.push(d)
+    if (typeof d === 'function') {
+      disposers.push(d)
+      allEffectDisposers.push(d)
+    }
     return d
   }
   await apply(ctxCmd, { enabled: true })
-  check('/dream auto-registered via commands service', registeredC.length === 1 && registeredC[0].name === 'dream',
+  check('/dream + /memory_migration auto-registered via commands service',
+    registeredC.length === 2 && registeredC[0].name === 'dream' && registeredC[1].name === 'memory_migration',
     JSON.stringify(registeredC.map((d) => d.name)))
+  const migrationStatus = registeredC[1].handler({ rawInput: 'status' })
+  check('/memory_migration status reports coordinator phase',
+    migrationStatus.kind === 'success' && migrationStatus.text.includes('scheduled'), JSON.stringify(migrationStatus))
+  const badMigrationAction = registeredC[1].handler({ rawInput: 'unknown' })
+  check('/memory_migration rejects unknown action with usage',
+    badMigrationAction.kind === 'error' && badMigrationAction.text.includes('status | retry | pause'), JSON.stringify(badMigrationAction))
 }
 
 
@@ -1715,6 +1735,12 @@ check('disabled registers nothing', toolsOff.length === 0 && Object.keys(handler
 db.close(); db2.close(); db3.close(); db4.close()
 dbW.close()
 closeAllDbs()
+for (const dispose of [...allEffectDisposers].reverse()) {
+  try { await dispose() } catch { /* cleanup failures are covered by focused tests */ }
+}
+if (originalDshHome === undefined) delete process.env.DSH_HOME
+else process.env.DSH_HOME = originalDshHome
+rmSync(migrationTestHome, { recursive: true, force: true })
 rmSync(ws, { recursive: true, force: true })
 rmSync(ws2, { recursive: true, force: true })
 rmSync(ws3, { recursive: true, force: true })

@@ -36,6 +36,12 @@ const hostOptions = {
   logLevel: 'info',
 };
 
+const workerOptions = {
+  ...hostOptions,
+  entryPoints: ['src/migration-worker.ts'],
+  outfile: 'lib/migration-worker.js',
+};
+
 const clientOptions = {
   entryPoints: ['src/client.ts'],
   bundle: true,
@@ -65,6 +71,7 @@ const clientOptions = {
 
 if (watch) {
   await (await context(hostOptions)).watch();
+  await (await context(workerOptions)).watch();
   await (await context(clientOptions)).watch();
   console.log('[build] watching src/ for changes...');
 } else {
@@ -83,5 +90,5 @@ if (watch) {
     recursive: true,
     filter: keepInPackage,
   });
-  await Promise.all([build(hostOptions), build(clientOptions)]);
+  await Promise.all([build(hostOptions), build(workerOptions), build(clientOptions)]);
 }
