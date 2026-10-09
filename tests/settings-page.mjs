@@ -101,11 +101,10 @@ function renderPage() {
   return settings.MemorySettingsSection({ scope })
 }
 
-// ── 1. 注册契约：label 是函数，语言切换触发重注册 ────────────────────────────
-// slots.inject 在 slot 可用时同步调用回调（真实外壳语义）→ applySettingsPage 里
-// 注册一次；随后 i18n 订阅在挂载时立即回调，会再重注册一次（幂等，文案相同）。
-console.log('=== 1. settings.section 注册与语言重注册 ===')
+// ── 1. 注册契约：等待父级声明，语言变化由外壳投影动态 label ────────────────
+console.log('=== 1. settings.section 注册与语言投影 ===')
 const registrations = []
+let declareSection
 const ctx = {
   settingsScope: { bind: () => ({ subscribe: () => () => {}, getSnapshot: () => ({}), set: async () => {}, unset: async () => {} }) },
   slots: {
@@ -114,13 +113,15 @@ const ctx = {
       return () => {}
     },
     inject: (_slot, cb) => {
-      cb()
-      return () => {}
+      declareSection = cb
+      return () => { declareSection = undefined }
     },
   },
 }
 settings.setUiLocaleForTest('zh')
 const dispose = settings.applySettingsPage(ctx)
+check('父级未声明前不注册', registrations.length === 0)
+declareSection()
 check('注册了一次 settings.section', registrations.length >= 1 && registrations[0].options.name === 'settings.section', String(registrations.length))
 check('注册参数 id/order 正确', registrations[0].options.id === 'meow-memory' && registrations[0].options.order === 35)
 check('label 是函数（官方契约：注册者本地化）', typeof registrations[0].options.label === 'function')
@@ -128,14 +129,14 @@ check('zh 标签', registrations[0].options.label() === '喵记忆', registratio
 check('渲染组件已挂上', typeof registrations[0].component === 'function')
 check('CSS 只注入一次', head.length === 1)
 
-// 语言切换 → 重新注册（否则外壳永远显示旧语言）。
+// 目标 DSH 的外壳订阅 locale 并重读 label：不应脱离 inject 生命周期重注册。
 const afterMount = registrations.length
 settings.setUiLocaleForTest('en')
-check('切到 en 后重注册', registrations.length === afterMount + 1, String(registrations.length))
-check('en 标签', registrations[registrations.length - 1].options.label() === 'Meow memory', registrations[registrations.length - 1].options.label())
+check('切到 en 后不重注册', registrations.length === afterMount, String(registrations.length))
+check('en 标签动态投影', registrations[0].options.label() === 'Meow memory', registrations[0].options.label())
 settings.setUiLocaleForTest('pt-br')
-check('切到 pt-br 后重注册', registrations.length === afterMount + 2, String(registrations.length))
-check('pt-br 标签', registrations[registrations.length - 1].options.label() === 'Meow memory', registrations[registrations.length - 1].options.label())
+check('切到 pt-br 后不重注册', registrations.length === afterMount, String(registrations.length))
+check('pt-br 标签动态投影', registrations[0].options.label() === 'Meow memory', registrations[0].options.label())
 
 dispose()
 const afterDispose = registrations.length

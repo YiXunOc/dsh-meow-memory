@@ -717,18 +717,11 @@ export function applySettingsPage(ctx: any, opts?: SettingsPageMountOptions): ()
   const maxPollAttempts = opts?.maxPollAttempts ?? 75
 
   // 顶级分区（与「通用」「模型」「插件」平级）：list slot 契约 = id + order + label。
-  // label 是「注册者本地化」的文案：外壳不订阅 locale 状态，注册者要在语言切换时
-  // 用新文案重注册（官方契约原话），所以这里保存注册 disposer，语言一变就重注册。
+  // 外壳订阅 locale，label 在投影时求值；注册必须等到 parent 宣告 slot。
   const mountWithScope = (scope: any): () => void => {
     injectSettingsCss()
-    let disposeEntry: (() => void) | null = null
-    const registerSection = (): void => {
-      try {
-        disposeEntry?.()
-      } catch {
-        /* 旧条目已在卸载：继续注册新条目 */
-      }
-      disposeEntry = ctx.slots.register(
+    const disposeInjection = ctx.slots.inject('settings.section', () =>
+      ctx.slots.register(
         {
           name: 'settings.section',
           id: SETTINGS_NS,
@@ -737,19 +730,10 @@ export function applySettingsPage(ctx: any, opts?: SettingsPageMountOptions): ()
           inject: (): unknown => ({ scope }),
         },
         MemorySettingsSection,
-      )
-    }
-    const disposeInjection = ctx.slots.inject('settings.section', registerSection)
-    const unsubscribeLocale = onUiLocaleChange(registerSection)
+      ))
     return () => {
-      unsubscribeLocale()
       try {
         disposeInjection()
-      } catch {
-        /* 清理失败不阻塞 */
-      }
-      try {
-        disposeEntry?.()
       } catch {
         /* 清理失败不阻塞 */
       }
