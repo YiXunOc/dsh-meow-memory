@@ -318,13 +318,21 @@ console.log('=== 7. locale 服务晚到重试 ===')
   check('晚到：达上限后放弃（迟到服务不再注册）', registered.length === 0, String(registered.length))
 }
 {
-  // 老宿主（ctx 连 get 都没有）→ v0.28.0 决策的永久回退场景：不轮询、不炸
-  const inst = await bundleSrc('src/i18n/index.ts')
-  inst.setLocaleRetryForTest(5, 5)
-  inst.installI18n({}, () => {})
-  check('老宿主：无 get 能力走静态查表回退', inst.getUiLocale() === 'zh')
-  await new Promise((r) => setTimeout(r, 40))
-  check('老宿主：不轮询不炸', inst.getUiLocale() === 'zh')
+  // No browser language signal: even Node versions exposing navigator.language
+  // must exercise the documented historical zh fallback deterministically.
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: undefined })
+  try {
+    const inst = await bundleSrc('src/i18n/index.ts')
+    inst.setLocaleRetryForTest(5, 5)
+    inst.installI18n({}, () => {})
+    check('老宿主：无 get 能力走静态查表回退', inst.getUiLocale() === 'zh')
+    await new Promise((r) => setTimeout(r, 40))
+    check('老宿主：不轮询不炸', inst.getUiLocale() === 'zh')
+  } finally {
+    if (navigatorDescriptor === undefined) delete globalThis.navigator
+    else Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)
