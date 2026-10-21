@@ -129,7 +129,7 @@ When it is unset: the plugin runs as `zh`, and the first real user message after
 
 The reflection turn and each dream group always run in the main window (steer) — prompts, replies, and tool calls land in the main session log (the fold UI keeps them tidy). The standalone fork-subagent execution mode was removed in v0.24; there is no longer an "independent execution" switch.
 
-To run memory work on a different (cheaper) model: with `delegate.model` set, every LLM request issued during reflection/dream turns gets its provider/model overridden via dsh's `agent/request` waterfall, and the main model takes over again once the turn ends — normal conversation and tool rounds are untouched. The implementation is stateless: each request is judged by whether the current turn carries a reflection/dream directive marker, so user aborts, crashes, and hot reloads can never leave a stuck "overridden" state.
+To use a different model for memory work, set `delegate.model`. The plugin recognizes pending reflection/dream directives at `agent/pre-step`, before the first request, and snapshots the effective model for that task. `agent/request` overrides the route for its requests; ordinary conversation retains the main model. Settings changes apply to the next memory task without reloading; an active task keeps its selected model.
 
 ---
 

@@ -264,7 +264,7 @@ const config = z.object({
     })
     .default({}),
   /** 整理任务的模型（可选换模型）。反思/梦境永远在主窗口执行（steer）——配置了
-   *  model 时仅在这两类轮的请求上经 agent/request waterfall 覆盖 provider/model，
+   *  model 时在整理任务首请求前识别身份，并经 agent/request 覆盖 provider/model；
    *  轮次结束自动换回主模型；不再提供"独立执行"开关（v0.24 移除）。 */
   delegate: z
     .object({
@@ -527,6 +527,32 @@ export function isMemoryTaskTurn(events: readonly unknown[]): boolean {
   return false
 }
 
+function previousConversationRoute(events: readonly unknown[]): { provider: string; model: string } | undefined {
+  let sawCurrentHeader = false
+  let memoryTurn = false
+  let header: { provider: string; model: string } | undefined
+  // 仅当最近一次请求头来自整理轮，才向前查找正常会话路由。
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as { type?: string; data?: { source?: { kind?: string }; content?: Array<{ type?: string; text?: string }>; header?: { config?: { provider?: string; model?: string } } } }
+    if (e.type === 'request/header' && header === undefined) {
+      const cfg = e.data?.header?.config
+      if (cfg?.provider && cfg.model) header = { provider: cfg.provider, model: cfg.model }
+    }
+    if (e.type === 'user/message' && e.data?.source?.kind !== 'user' &&
+      e.data?.content?.some((b) => b.type === 'text' && (b.text?.includes(REFLECT_MARKER) || b.text?.includes(DREAM_MARKER)))) memoryTurn = true
+    if (e.type !== 'turn/start') continue
+    if (header !== undefined) {
+      if (!sawCurrentHeader) {
+        if (!memoryTurn) return undefined
+        sawCurrentHeader = true
+      } else if (!memoryTurn) return header
+    }
+    header = undefined
+    memoryTurn = false
+  }
+  return undefined
+}
+
 /** 最近一个 turn/end 的 reason.kind（aborted/interrupted 表示用户停止，不反思不推进）。 */
 function lastTurnEndReason(events: readonly unknown[]): string | null {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -645,8 +671,8 @@ const SETTINGS_SOURCE_WAIT_MS = 250
 // ⚠️ 接线坑（#26 报告人 v1 实机踩坑）：settingsGet 本身是个函数（()=>scope.get()），
 // 外层必须再包一层 thunk 捕获 applyInner 作用域里那个稍后才赋值的 let——把函数本体
 // 当源传进去，引用恒定 → 缓存永不失效 → 单测全绿而实机仍按启动默认值跑。
-// 注册期消费的字段（projectDir/homeDir/enabled/delegate.modelSpec + setPromptLang 的
-// 启动调用）保持冻结：热改需要 dispose+重入，设置页按「需重载」语义对待（#26 同口径）。
+// 配置了 delegate.model 后，首个整理请求在 pre-step 已认领任务身份；
+// modelSpec 在新任务开始时从设置源读取，不在注册期冻结。
 
 const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
 const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays'] as const
@@ -1226,6 +1252,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 插件注入轮（反思/dream 的 steer 消息轮）内的事件不刷新 last_event_time：
   // dream 轮自身事件会推后窗口活跃度 → 收尾后 last_dream_time < last_event_time
   // → 窗口永远"需要 dream"，配合中断/多进程场景造成反复 dream。
+  // pre-step 在请求前标记整理轮；模型按 (session, turn) 固定。
+  const memoryRoutes = new Map<string, { turn: number; spec: AgentOptionsSpec | undefined; paused?: boolean }>()
+  const originalRoutes = new Map<string, { provider: string; model: string }>()
   const lastWindowWrite = new Map<string, number>()
   const isPluginTurn = new Map<string, boolean>() // sid -> 本 turn 是否为 meow-memory 插件轮
   const turnHadMessage = new Map<string, boolean>() // sid -> 本 turn 是否出现过任何 user/message（#36 裸轮判定：dream 任务被 claim 后未及落盘就装配崩溃的轮，全程零消息）
@@ -1258,6 +1287,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     }
     if (typeof sid === 'string') {
       if (t === 'turn/start') {
+        memoryRoutes.delete(sid) // 上一轮残留状态清理；本轮 pre-step 随后重新认领
         isPluginTurn.set(sid, false) // 新轮重置
         turnHadMessage.set(sid, false) // 新轮重置（#36 裸轮判定基线）
         return
@@ -1303,6 +1333,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       // ② 「裸轮」error（本 turn 全程零 user/message）且有活跃 dream 租约 → 同样处理
       //    （dream 任务被 claim 后未及落盘就装配崩溃的形状；窗口此刻非活跃使用场景，
       //    误判代价仅为提前重试一次）。
+      if (t === 'turn/end') memoryRoutes.delete(sid)
       if (t === 'turn/end' && (event.data as { reason?: { kind?: string } } | undefined)?.reason?.kind === 'error') {
         const pluginTurn = isPluginTurn.get(sid) === true
         const nakedTurn = turnHadMessage.get(sid) === false // turn/start 已见、其后零消息
@@ -1334,6 +1365,17 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     persistWindowIndex() // 窗口索引落盘（热重载/重启后恢复）
   })
 
+  const currentMemorySpec = (): AgentOptionsSpec | undefined => {
+    try {
+      return resolveConfig(mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)).delegate.modelSpec
+    } catch {
+      return resolved.delegate.modelSpec
+    }
+  }
+  const pendingMemoryMessage = (messages: readonly { source?: unknown; content?: Array<{ type?: string; text?: string }> }[]): boolean =>
+    messages.some((m) => isMeowSource(m.source) && (m.content ?? []).some((b) => b.type === 'text' &&
+      (b.text?.includes(REFLECT_MARKER) || b.text?.includes(DREAM_MARKER))))
+
   // 1) 注入：首轮快照（soul/user/设计原则/导引，仅一次）+ 命中链路（第二条起每条真实用户消息都跑）。
   // 首轮判定（真机踩坑 2026-08-16）：不能看 decision.messages[0]——首条用户消息可能与
   // 插件通知消息同批到达（如 user-approval 的 policy 变更通知，source.kind='plugin'），
@@ -1347,9 +1389,23 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // agent-loop 传播改变宿主 turn 的错误语义。包装器单独持有 next()——宿主 step
   // 自身的错误原样上抛（abort 语义在内），只有本插件自己的注入/检索失败才吞掉
   // （放弃本轮注入、放行原始 decision，与本插件其余路径的 fail-open 同风格）。
-  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, turn, step, signal }, next) => {
     const decision = await next()
     try {
+      if (decision?.kind === 'enter' && !signal.aborted && agent.session.header.origin !== 'subagent') {
+        const sid = sessionIdOfAgent(agent)
+        const previous = memoryRoutes.get(sid)
+        if (previous !== undefined && previous.turn !== turn) memoryRoutes.delete(sid)
+        const hasUser = decision.messages.some((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
+        if (hasUser) {
+          const route = memoryRoutes.get(sid)
+          if (route !== undefined && route.turn === turn) route.paused = true
+          else if (pendingMemoryMessage(decision.messages)) memoryRoutes.set(sid, { turn, spec: undefined, paused: true })
+        } else if (pendingMemoryMessage(decision.messages)) {
+          if (previous?.turn !== turn) memoryRoutes.set(sid, { turn, spec: currentMemorySpec() })
+          if (previous !== undefined && previous.turn === turn) previous.paused = false
+        }
+      }
       // preStepInject 内部把 decision 当透传黑盒（any）；出口 cast 回宿主形状。
       return (await preStepInject({ agent, signal }, decision)) as typeof decision
     } catch (e) {
@@ -1611,31 +1667,36 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)
   }
 
-  // 2.5) 整理任务换模型（agent/request waterfall，dsh 官方单请求模型覆盖扩展点）：
-  //   配置了 delegate.model 时，本会话「反思轮/梦境轮」的请求把 provider/model 覆盖为
-  //   配置值，其余请求（正常对话/工具轮）原样放行——触发前换上、轮次结束自动换回，
-  //   无状态：判定=当前 turn 的指令消息是否带 [meow-memory-reflect]/[meow-memory-dream]
-  //   文本标记（steer 指令消息在请求前已落 log，agent-loop L554 实证；与 wasDreamTurn/
-  //   isPluginTurn 同口径），不存在需要清理的"覆盖中"状态——用户中止/崩溃/热重载
-  //   都不留脏覆盖。
-  // waterfall 契约：listener 必须 return 最终 config（不改也要透传 next() 结果）。
-  if (resolved.delegate.modelSpec !== undefined) {
-    const spec = resolved.delegate.modelSpec
-    ctx.on('agent/request', async (payload: { agent?: { session?: { header?: SessionHeaderLike } } }, next: () => Promise<unknown>) => {
-      const config = await next() as { provider?: string; model?: string }
-      const agent = payload?.agent
-      // 子代理请求不覆盖（fork 子代理已不再由本插件产生；GUI 手动 fork 的照常放行）
-      if (agent === undefined || agent.session?.header?.origin === 'subagent') return config
-      if (!isMemoryTaskTurn(sessionEventsOf(agent.session as never))) return config
-      ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
-      return {
-        ...config,
-        ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
-        ...(spec.model !== undefined ? { model: spec.model } : {}),
-      }
-    })
-    ctx.logger.info(`meow-memory: model override armed for reflect/dream turns (${spec.provider ?? '(inherit)'}/${spec.model ?? ''})`)
-  }
+  // 2.5) 整理任务换模型：pre-step 在首请求前记录任务身份与模型快照；
+  // 请求钩子始终注册，空配置→非空配置无需重载。旧会话只有日志标记时保留兼容。
+  ctx.on('agent/request', async (payload: { agent?: { session?: { header?: SessionHeaderLike } }; turn?: number; step?: number }, next: () => Promise<unknown>) => {
+    const config = await next() as { provider?: string; model?: string }
+    const agent = payload?.agent
+    if (agent === undefined || agent.session?.header?.origin === 'subagent') return config
+    const sid = sessionIdOfAgent(agent)
+    const events = sessionEventsOf(agent.session as never)
+    const restore = originalRoutes.get(sid) ?? previousConversationRoute(events)
+    const route = memoryRoutes.get(sid)
+    const active = route?.turn === payload.turn
+    if (route !== undefined && !active) memoryRoutes.delete(sid)
+    // DSH 的 next() 继承上一次 request/header；透传不等于恢复主路由。
+    const base = restore === undefined ? config : { ...config, provider: restore.provider, model: restore.model }
+    if (active && route?.paused) return base
+    const spec = active ? route?.spec : isMemoryTaskTurn(sessionEventsOf(agent.session as never)) ? currentMemorySpec() : undefined
+    if (spec === undefined) {
+      if (!active) originalRoutes.delete(sid)
+      return base
+    }
+    if (restore === undefined && typeof config.provider === 'string' && typeof config.model === 'string') {
+      originalRoutes.set(sid, { provider: config.provider, model: config.model })
+    }
+    ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
+    return {
+      ...base,
+      ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
+      ...(spec.model !== undefined ? { model: spec.model } : {}),
+    }
+  })
 
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
   const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState, workspaceDisabled)

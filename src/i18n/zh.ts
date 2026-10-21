@@ -55,7 +55,7 @@ export const zh: Record<UiKey, string> = {
   'settings.loading': '喵记忆配置加载中…',
   'settings.unavailable': '当前连接不支持设置写入（仅本机回环连接可编辑）。',
   'settings.readonly': '当前连接为只读（设置写入仅限本机回环连接）。',
-  'settings.saved': '已保存 ✓ 热重载/重启 meow-memory 插件后生效',
+  'settings.saved': '已保存 ✓ 整理任务模型从下一次反思/梦境生效；其他注册期设置仍需重载插件',
   'settings.badge.override': '已覆盖',
   'settings.badge.default': '默认',
   'settings.reset': '恢复默认',

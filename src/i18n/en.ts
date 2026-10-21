@@ -66,7 +66,7 @@ export const en: Record<UiKey, string> = {
   'settings.loading': 'Loading meow-memory configuration…',
   'settings.unavailable': 'This connection does not support settings writes (only loopback connections can edit).',
   'settings.readonly': 'This connection is read-only (settings writes are limited to loopback connections).',
-  'settings.saved': 'Saved ✓ takes effect after a hot reload or restart of the meow-memory plugin',
+  'settings.saved': 'Saved ✓ memory model applies to the next reflection/dream task; other registration-time settings still require a plugin reload',
   'settings.badge.override': 'Overridden',
   'settings.badge.default': 'Default',
   'settings.reset': 'Restore default',

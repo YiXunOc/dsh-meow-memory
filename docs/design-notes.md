@@ -113,7 +113,7 @@ The standalone fork-subagent execution mode was removed in **v0.24**; there is n
 
 The reflection turn and each dream group now **always run in the main window (steer)** — prompts, replies, and tool calls land in the main session log (the fold UI keeps them tidy).
 
-Model swapping moved to `delegate.model`: every LLM request issued during reflection/dream turns gets its provider/model overridden via dsh's `agent/request` waterfall, and the main model takes over once the turn ends. The implementation is **stateless** — each request is judged by whether the current turn carries a reflection/dream directive marker, so user aborts, crashes, and hot reloads can never leave a stuck "overridden" state.
+Model swapping uses `delegate.model`: `agent/pre-step` recognizes pending reflection/dream directives before the first request and snapshots the effective model for the task. `agent/request` overrides the route and explicitly restores the prior session route for interruptions and ordinary turns, since DSH seeds later requests from the previous request header. Settings changes apply to the next memory task, not midway through an active task.
 
 ---
 

@@ -1866,10 +1866,78 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   // 子代理请求 → 不覆盖
   const out5 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-5', origin: 'subagent' }, events: reflectEvents } }, turn: 5, step: 1, signal: new AbortController().signal }, seed)
   check('model override: subagent request untouched', out5.provider === 'base' && out5.model === 'base-model')
-  // 未配置模型 → 完全不注册 waterfall（零开销路径）
+  // 宿主真实顺序：pre-step 先领取整理消息，agent/request 先选模型，随后才 append user/message。
+  const dFirst = makeCtx()
+  await apply(dFirst.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/memory' } })
+  const firstAgent = { session: { header: { cwd: ws, id: 's-first-route' }, events: [events.turnStart()] } }
+  const directive = { source: { kind: 'plugin:meow-memory' }, content: [{ type: 'text', text: '[meow-memory-reflect] 整理' }] }
+  await dFirst.handlers['agent/pre-step']({ agent: firstAgent, turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [directive] }))
+  const firstRoute = await dFirst.handlers['agent/request']({ agent: firstAgent, turn: 1, step: 1 }, seed)
+  check('model override: first request before directive is logged', firstRoute.provider === 'prov' && firstRoute.model === 'memory', JSON.stringify(firstRoute))
+  const inherited = async () => ({ ...firstRoute })
+  // 后续工具步骤维持快照；新 turn 不继承。
+  firstAgent.session.events.push({ type: 'user/message', data: directive })
+  await dFirst.handlers['agent/pre-step']({ agent: firstAgent, turn: 1, step: 2, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [] }))
+  const laterRoute = await dFirst.handlers['agent/request']({ agent: firstAgent, turn: 1, step: 2 }, seed)
+  check('model override: subsequent request retains task model', laterRoute.model === 'memory')
+  firstAgent.session.events.push(events.turnStart())
+  const nextRoute = await dFirst.handlers['agent/request']({ agent: firstAgent, turn: 2, step: 1 }, inherited)
+  check('model override: next turn restores main model from inherited route', nextRoute.provider === 'base' && nextRoute.model === 'base-model', JSON.stringify(nextRoute))
+  // 插件热重载后内存快照丢失：从会话历史中最后一个整理 turn 之前的请求头恢复。
+  const dReload = makeCtx()
+  await apply(dReload.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/memory' } })
+  const resumedAgent = { session: { header: { cwd: ws, id: 's-reload-route' }, events: [
+    events.turnStart(), { type: 'request/header', data: { header: { config: { provider: 'base', model: 'base-model' } } } },
+    { type: 'turn/end', data: {} }, events.turnStart(), { type: 'user/message', data: directive },
+    { type: 'request/header', data: { header: { config: { provider: 'prov', model: 'memory' } } } },
+    { type: 'turn/end', data: {} }, events.turnStart(),
+  ] } }
+  const restoredAfterReload = await dReload.handlers['agent/request']({ agent: resumedAgent, turn: 3, step: 1 }, inherited)
+  check('model override: reload restores route from prior non-memory header', restoredAfterReload.provider === 'base' && restoredAfterReload.model === 'base-model', JSON.stringify(restoredAfterReload))
+  // 同轮插话只跳过该用户步骤；梦境下一组仍沿用整理模型。
+  const dreamAgent = { session: { header: { cwd: ws, id: 's-dream-route' }, events: [events.turnStart()] } }
+  const dreamDirective = { source: { kind: 'plugin:meow-memory' }, content: [{ type: 'text', text: '[meow-memory-dream] 第一组' }] }
+  const runPre = (agent, turn, step, messages) => dFirst.handlers['agent/pre-step'](
+    { agent, turn, step, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages }))
+  const runReq = (agent, turn, step, next = seed) => dFirst.handlers['agent/request']({ agent, turn, step }, next)
+  await runPre(dreamAgent, 1, 1, [dreamDirective])
+  const dreamFirstRoute = await runReq(dreamAgent, 1, 1)
+  check('model override: dream first request', dreamFirstRoute.model === 'memory')
+  dreamAgent.session.events.push({ type: 'user/message', data: dreamDirective })
+  await runPre(dreamAgent, 1, 2, [{ source: { kind: 'user' }, content: [{ type: 'text', text: '插话' }] }])
+  const interruptedRoute = await runReq(dreamAgent, 1, 2, async () => ({ ...dreamFirstRoute }))
+  check('model override: user interruption restores main from inherited route', interruptedRoute.provider === 'base' && interruptedRoute.model === 'base-model', JSON.stringify(interruptedRoute))
+  await runPre(dreamAgent, 1, 3, [])
+  check('model override: user tool continuation stays main', (await runReq(dreamAgent, 1, 3, async () => ({ ...interruptedRoute }))).model === 'base-model')
+  await runPre(dreamAgent, 1, 4, [{ source: { kind: 'plugin:meow-memory' }, content: [{ type: 'text', text: '[meow-memory-dream] 第二组' }] }])
+  check('model override: subsequent dream group retains model', (await runReq(dreamAgent, 1, 4)).model === 'memory')
+  await runPre(dreamAgent, 1, 5, [dreamDirective, { source: { kind: 'user' }, content: [{ type: 'text', text: '同批插话' }] }])
+  check('model override: mixed user and directive stays main', (await runReq(dreamAgent, 1, 5)).model === 'base-model')
+  // 设置页源从空值热改为专有模型，当前任务不变，新任务生效。
+  let userLayer = { delegate: { model: '' } }
+  const dHot = makeCtx()
+  const settingsSvc = { installSection: (_owner, _ns, _schema, _entry, hooks) => { hooks.setSource(() => userLayer); return () => {} } }
+  dHot.ctx.get = (name) => name === 'settings' ? settingsSvc : undefined
+  dHot.ctx.inject = (_deps, cb) => { queueMicrotask(() => cb({ settings: settingsSvc, effect: dHot.ctx.effect })) }
+  await apply(dHot.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: '' } })
+  const hotAgent = { session: { header: { cwd: ws, id: 's-hot-route' }, events: [events.turnStart()] } }
+  const hotPre = (turn) => dHot.handlers['agent/pre-step']({ agent: hotAgent, turn, step: 1, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [directive] }))
+  const hotReq = (turn) => dHot.handlers['agent/request']({ agent: hotAgent, turn, step: 1 }, seed)
+  await hotPre(1)
+  userLayer = { delegate: { model: 'other/new-model' } }
+  check('model override: active task retains blank snapshot', (await hotReq(1)).model === 'base-model')
+  hotAgent.session.events.push(events.turnStart())
+  await hotPre(2)
+  const hotRoute = await hotReq(2)
+  check('model override: next task reads updated settings', hotRoute.provider === 'other' && hotRoute.model === 'new-model', JSON.stringify(hotRoute))
+  userLayer = { delegate: { model: '' } }
+  hotAgent.session.events.push(events.turnStart())
+  await hotPre(3)
+  check('model override: clearing settings restores main model', (await hotReq(3)).model === 'base-model')
+  // 空配置仍注册钩子，以便设置页热改后下一整理任务生效。
   const d2 = makeCtx()
   await apply(d2.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
-  check('model override: no model → no waterfall registered', d2.handlers['agent/request'] === undefined)
+  check('model override: no model still registers pass-through waterfall', typeof d2.handlers['agent/request'] === 'function')
 }
 
 // isMemoryTaskTurn 单元：跨 turn 边界（marker 只认当前 turn，上一轮的 marker 不残留）

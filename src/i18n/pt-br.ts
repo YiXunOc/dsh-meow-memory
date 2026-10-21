@@ -57,7 +57,7 @@ export const ptBr: Record<UiKey, string> = {
   'settings.loading': 'Carregando a configuração do meow-memory…',
   'settings.unavailable': 'Esta conexão não permite gravar configurações (só conexões locais de loopback podem editar).',
   'settings.readonly': 'Esta conexão é somente leitura (gravar configurações é limitado a conexões locais de loopback).',
-  'settings.saved': 'Salvo ✓ passa a valer após recarregar a quente ou reiniciar o plugin meow-memory',
+  'settings.saved': 'Salvo ✓ o modelo de memória vale na próxima reflexão/sonho; outras configurações de registro ainda exigem recarregar o plugin',
   'settings.badge.override': 'Alterado',
   'settings.badge.default': 'Padrão',
   'settings.reset': 'Restaurar padrão',
