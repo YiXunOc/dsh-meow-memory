@@ -25,6 +25,11 @@ import {
   buildHitInjection,
   buildReinjection,
   buildReflectMessage,
+  scanTurn,
+  runMemoryChild,
+  isOwnedMemoryChild,
+  noteMemoryChildToolError,
+  disposeMemoryChildren,
   markProjectQueried,
   readProjectQueried,
   isReinjectPending,
@@ -261,36 +266,44 @@ check('claimDream succeeds first', dbW.claimDream('win-1', 'o1', 1000, LEASE) ==
 check('claimDream second fails (active lease)', dbW.claimDream('win-1', 'o2', 1000, LEASE) === false)
 check('isDreamPending true', dbW.isDreamPending('win-1') === true)
 check('getDreamLease reads owner/idx/T', (() => { const l = dbW.getDreamLease('win-1'); return l !== null && l.owner === 'o1' && l.group_idx === 0 && l.T === 1000 })())
-dbW.finishDream('win-1', 3000)
+dbW.finishDream('win-1', 'o1', 3000)
 check('finishDream clears lease', dbW.isDreamPending('win-1') === false && dbW.getDreamLease('win-1') === null)
 check('finishDream sets last_dream_time', dbW.getWindow('win-1')?.last_dream_time === 3000)
 check('claimDream succeeds after finish', dbW.claimDream('win-1', 'o3', 1000, LEASE) === true)
 check('claim on missing window creates row', dbW.claimDream('win-missing', 'o4', 1000, LEASE) === true &&
   dbW.getDreamLease('win-missing')?.owner === 'o4')
-dbW.finishDream('win-missing', 0)
-dbW.finishDream('win-1', 0)
+dbW.finishDream('win-missing', 'o4', 0)
+dbW.finishDream('win-1', 'o3', 0)
 // 租约过期后可被重新抢占（模拟主人死亡）
 dbW.claimDream('win-1', 'o5', 1000, LEASE)
 dbW.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * LEASE, 'win-1')
 check('claimDream reclaims expired lease', dbW.claimDream('win-1', 'o6', 2000, LEASE) === true)
 check('getDreamLease reads reclaimed owner/T', (() => { const l = dbW.getDreamLease('win-1'); return l !== null && l.owner === 'o6' && l.T === 2000 })())
+check('stale owner cannot heartbeat, advance, release or finish replacement',
+  !dbW.touchDreamLease('win-1', 'o5', LEASE) &&
+  !dbW.advanceDreamLease('win-1', 'o5', 0, LEASE) &&
+  !dbW.releaseDream('win-1', 'o5') &&
+  !dbW.finishDream('win-1', 'o5', 9999) &&
+  dbW.getDreamLease('win-1')?.owner === 'o6' && dbW.getWindow('win-1')?.last_dream_time === 0)
+check('stale owner cannot stamp replacement memories', dbW.finalizeOwnedDream('win-1', 'o5', 1000, LEASE) === null && dbW.getDreamLease('win-1')?.owner === 'o6')
+check('stale owner cannot record failure against replacement', dbW.releaseDreamFailure('win-1', 'o5', 1000) === null && !dbW.dreamFailureCapped('win-1', 1000, 1))
 // releaseDream（2026-09-05 error 重试语义）：只清租约，last_dream_time 不动
-dbW.finishDream('win-1', 5000)
+dbW.finishDream('win-1', 'o6', 5000)
 dbW.claimDream('win-1', 'o7', 1000, LEASE)
-dbW.releaseDream('win-1')
+dbW.releaseDream('win-1', 'o7')
 check('releaseDream clears lease', dbW.isDreamPending('win-1') === false && dbW.getDreamLease('win-1') === null)
 check('releaseDream keeps last_dream_time', dbW.getWindow('win-1')?.last_dream_time === 5000)
-dbW.finishDream('win-1', 0)
+dbW.finishDream('win-1', null, 0)
 // 轮内心跳（2026-09-10）：touch 只刷 progress_at，不动 group_idx/T；租约清掉后返回 false
 // ——心跳据此自动停表，僵尸 dream 不会被续命。
 dbW.claimDream('win-hb', 'o-hb', 1000, LEASE)
 const beforeTouch = dbW.getDreamLease('win-hb')
-check('touchDreamLease refreshes active lease', dbW.touchDreamLease('win-hb') === true)
+check('touchDreamLease refreshes active lease', dbW.touchDreamLease('win-hb', 'o-hb') === true)
 const afterTouch = dbW.getDreamLease('win-hb')
 check('touchDreamLease keeps group_idx/T', afterTouch !== null && beforeTouch !== null && afterTouch.group_idx === beforeTouch.group_idx && afterTouch.T === beforeTouch.T && afterTouch.progress_at >= beforeTouch.progress_at)
-dbW.releaseDream('win-hb')
-check('touchDreamLease false after lease cleared', dbW.touchDreamLease('win-hb') === false)
-check('touchDreamLease false for unknown window', dbW.touchDreamLease('win-never') === false)
+dbW.releaseDream('win-hb', 'o-hb')
+check('touchDreamLease false after lease cleared', dbW.touchDreamLease('win-hb', 'o-hb') === false)
+check('touchDreamLease false for unknown window', dbW.touchDreamLease('win-never', 'o-hb') === false)
 
 // 全局检查门：minIntervalMs 内只有一个调用方通过（防多实例/多定时器叠加重复检查）
 check('check gate passes first', dbW.claimCheckGate(0) === true)
@@ -336,9 +349,10 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   const resumedAgent = { session: { header: { id: widR } }, steer: (m) => steered.push(m) }
   // mock 对齐现行契约：resume 在 agents service 本体（service.resume(options)），
   // factory 槽是 { target } 包装、其上无 resume（src/dream.ts resumeAndDream 实证）。
-  const ctxR = { get: (name) => (name === 'agents' ? { resume: async () => resumedAgent } : undefined) }
+  const memoryChildService = { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) }
+  const ctxR = { get: (name) => name === 'subagents' ? memoryChildService : name === 'agents' ? { resume: async () => resumedAgent } : undefined }
   await resumeAndDream(ctxR, widR, wsR, '.dsh-meow', undefined, cfgR)
-  check('resume: agent restored → dream started (steered + lease)', steered.length === 1 && dbR.getDreamLease(widR) !== null)
+  check('resume: agent restored → dream child started (lease held)', dbR.getDreamLease(widR) !== null)
 
   const wsR2 = mkdtempSync(join(tmpdir(), 'mm-resume-fail-'))
   const dbR2 = getDb(wsR2, '.dsh-meow')
@@ -398,32 +412,53 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
 
   // 零进展中断：释放待重试（旧 bug：一次中断就盖章，整窗记忆静默消失且永不重试）
   dbF.claimDream(widF, 'o-f1', 1000, LEASE)
+  dbF.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, widF)
   check('recover zero-progress releases (attempt 1)', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 &&
     dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
   dbF.claimDream(widF, 'o-f2', 1000, LEASE)
+  dbF.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, widF)
   check('recover zero-progress releases (attempt 2)', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 &&
     dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
-  // 第 3 次：达上限 → 封存止损（不再无限重试）
+  // 第 3 次达到重试上限：保留待整理记忆，不伪称 dreamed，直到新活动重置范围或手动触发
   dbF.claimDream(widF, 'o-f3', 1000, LEASE)
-  const leaseF3 = dbF.getDreamLease(widF)
+  dbF.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, widF)
   const retF3 = recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow')
-  console.log('DBG leaseT=', leaseF3?.T, 'ret=', retF3, 'meta=', JSON.stringify(dbF.db.prepare("SELECT key, value FROM dream_meta WHERE key LIKE 'dreamfail%' ORDER BY key").all()), 'last_dream=', dbF.getWindow(widF)?.last_dream_time)
-  check('recover zero-progress seals at cap', dbF.getWindow(widF)?.last_dream_time !== null && dbF.getDreamLease(widF) === null)
-  // 封存即收尾：计数清零（下一轮从 1 重计，不继承旧失败）
-  check('failure counter cleared after seal', dbF.recordDreamFailure(widF, 1000) === 1)
+  check('recover zero-progress stops without stamping at cap', retF3 === 0 && dbF.getWindow(widF)?.last_dream_time === null && dbF.getDreamLease(widF) === null)
+  dbF.claimDream(widF, 'o-partial', 1000, LEASE)
+  dbF.advanceDreamLease(widF, 'o-partial', 0, LEASE)
+  dbF.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, widF)
+  check('partial recovery never stamps unfinished rounds', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 && dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
+  dbF.claimDream(widF, 'o-current', 1000, LEASE)
+  check('recovery cannot release non-expired lease', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 && dbF.getDreamLease(widF)?.owner === 'o-current')
+  dbF.releaseDream(widF, 'o-current')
+  check('failure counter retained at cap', dbF.recordDreamFailure(widF, 1000) > 3)
   dbF.clearDreamFailure(widF)
-  dbF.releaseDream(widF)
+  dbF.releaseDream(widF, 'o-partial')
 
-  // turn/end error 的即时处理：无租约 → none；有租约 → 释放；连续达上限 → 封存
+  // turn/end error 的即时处理：无租约 → none；有租约 → 释放；连续达上限 → 暂停但不封存
   const widF2 = 'win-fail-2'
   dbF.touchWindow(widF2, wsF, Date.now() - 4 * 3600_000)
   check('turn-failure without lease is none', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'none')
-  dbF.claimDream(widF2, 'o-t1', 1000, LEASE)
+  const Tfailed = dbF.getWindow(widF2).last_event_time
+  dbF.claimDream(widF2, 'o-t1', Tfailed, LEASE)
   check('turn-failure releases active lease', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'released' && dbF.getDreamLease(widF2) === null)
-  dbF.claimDream(widF2, 'o-t2', 1000, LEASE)
+  dbF.claimDream(widF2, 'o-t2', Tfailed, LEASE)
   check('turn-failure accumulates (attempt 2 released)', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'released')
-  dbF.claimDream(widF2, 'o-t3', 1000, LEASE)
-  check('turn-failure seals at cap', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'sealed' && dbF.getWindow(widF2)?.last_dream_time !== null)
+  dbF.claimDream(widF2, 'o-t3', Tfailed, LEASE)
+  check('turn-failure stops at cap without stamp', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'stopped' && dbF.getWindow(widF2)?.last_dream_time === null && dbF.getDreamLease(widF2) === null)
+  const beforeRetry = dbF.getDreamLease(widF2)
+  dbF.insert({ level: 'fact', content: '供失败上限测试', source_session: widF2 })
+  check('cap blocks automatic retry for same T', beforeRetry === null && !startWindowDream({ get: (name) => name === 'subagents' ? { startActivation: () => { throw Error('must not retry') } } : undefined }, { session: { header: { id: widF2 } } }, wsF, '.dsh-meow'))
+  check('explicit manual request bypasses automatic failure cap', startWindowDream({ get: (name) => name === 'subagents' ? { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) } : undefined }, { session: { header: { id: widF2 } } }, wsF, '.dsh-meow', undefined, 2, undefined, true))
+  dbF.releaseDream(widF2, dbF.getDreamLease(widF2)?.owner ?? '')
+  const manualAgent = { session: { header: { cwd: wsF, id: widF2 } } }
+  const manualCtx = { get: (name) => name === 'subagents' ? { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) } : undefined }
+  const toolManual = (await import('./lib/index.js')).dreamTool(manualCtx, '.dsh-meow')
+  check('memory_dream bypasses cap', (await toolManual.execute({}, { agent: manualAgent })).ok === true)
+  dbF.releaseDream(widF2, dbF.getDreamLease(widF2)?.owner ?? '')
+  const commandManual = dreamCommandDefinition(manualCtx, '.dsh-meow')
+  check('/dream bypasses cap', commandManual.handler({ agent: manualAgent }).kind === 'success')
+  dbF.releaseDream(widF2, dbF.getDreamLease(widF2)?.owner ?? '')
   dbF.close()
   rmSync(wsF, { recursive: true, force: true })
 }
@@ -440,11 +475,9 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   const resumedWith = []
   const agentS2 = { session: { header: { id: widS2 } }, steer: () => {} }
   const ctxS2 = {
-    get: (name) => name === 'agents'
-      ? { resume: async (opts) => { resumedWith.push(opts); return agentS2 } }
-      : name === 'agentDefaultModel'
-        ? { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
-        : undefined,
+    get: (name) => name === 'subagents' ? { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) }
+      : name === 'agents' ? { resume: async (opts) => { resumedWith.push(opts); return agentS2 } }
+        : name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) } : undefined,
   }
   await resumeAndDream(ctxS2, widS2, wsS2, '.dsh-meow', undefined, cfgR2)
   check('resume: agentOptions from default selection', resumedWith.length === 1 &&
@@ -565,15 +598,17 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   dbS.touchWindow(widS3, wsS, Date.now() - 4 * 3600_000)
   dbS.insert({ level: 'fact', content: '主窗口的记忆', project: 'dsh', source_session: widS3, created_at: 100 })
   const mainAgent = { session: { header: { id: widS3 } }, steer: () => {} }
-  dreamSweepOnce({ get: (name) => (name === 'agents' ? { get: () => mainAgent } : undefined) }, cfgS, '.dsh-meow', new Map([[widS3, wsS]]))
+  const pendingS = { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) }
+  dreamSweepOnce({ get: (name) => name === 'subagents' ? pendingS : name === 'agents' ? { get: () => mainAgent } : undefined }, cfgS, '.dsh-meow', new Map([[widS3, wsS]]))
   check('sweep: main window still dreamed (lease held)', dbS.getDreamLease(widS3) !== null)
 
   // ⑤ 手动路径豁免：startWindowDream 直呼（/dream、memory_dream 走这里）不被判定拦截
   const steeredS = []
   const manualAgent = { session: { header: { id: widS, origin: 'subagent' } }, steer: (m) => steeredS.push(m) }
-  startWindowDream({ get: () => undefined }, manualAgent, wsS, '.dsh-meow')
-  check('manual startWindowDream not blocked for subagent', steeredS.length === 1)
-
+  startWindowDream({ get: (name) => name === 'subagents' ? pendingS : undefined }, manualAgent, wsS, '.dsh-meow')
+  check('manual startWindowDream not blocked for subagent', dbS.getDreamLease(widS) !== null)
+  dbS.releaseDream(widS, dbS.getDreamLease(widS)?.owner ?? '')
+  dbS.releaseDream(widS3, dbS.getDreamLease(widS3)?.owner ?? '')
   dbS.close()
   rmSync(wsS, { recursive: true, force: true })
 }
@@ -613,6 +648,7 @@ check('dream round0 marker + title', d0.includes('[meow-memory-dream]') && d0.in
 check('dream round0 project headings', d0.includes('【project：dsh】') && d0.includes('【project：femo】') && d0.includes('【project：无项目 - 全局信息，或缺少项目标签】'))
 check('dream round0 T label + timestamp rule', d0.includes('本窗口记忆封存时间戳：1970-01-01 00:00') && d0.includes('时间戳规则') && d0.includes('**最后更新**'))
 check('dream round0 judgement + rules', d0.includes('如何判断该更新') && d0.includes('project标签是否准确') && d0.includes('importance') && d0.includes('拆分成多条') && d0.includes('本组整理完成'))
+check('retry prompt avoids duplicate partial writes', d0.includes('重复') && d0.includes('memory_find_similar'))
 check('dream round0 row full id + absolute timestamps', /\[fact [a-z0-9]{9}-[a-z0-9]{26} \d{4}-\d{2}-\d{2} \d{2}:\d{2}\]/.test(d0))
 check('dream round0 rows carry keywords line', d0.includes('关键词: 事实, 测试') && d0.includes('关键词: （无）'))
 check('dream round0 excludes topic rows', !d0.includes('话题X') && !d0.includes('外来话题'))
@@ -658,15 +694,17 @@ const wsClaim = mkdtempSync(join(tmpdir(), 'mm-claim-'))
 const dbClaim = new MemoryDb(memoryDbPath(wsClaim))
 dbClaim.touchWindow('win-claim', wsClaim, Date.now())
 const agentClaim = { session: { header: { id: 'win-claim', cwd: wsClaim } }, steer: () => {} }
+const pendingChild = { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) }
+const ctxClaim = { get: (name) => name === 'subagents' ? pendingChild : undefined }
 // topic 轮默认触发：无记忆窗口也启动（空 topic 轮让 AI 回顾建新 topic）
-check('startWindowDream: no memories still starts (topic round)', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
+check('startWindowDream: no memories still starts (topic round)', startWindowDream(ctxClaim, agentClaim, wsClaim, '.dsh-meow') === true)
 check('lease set while running', dbClaim.getDreamLease('win-claim') !== null)
 advanceDream(agentClaim, '.dsh-meow') // 仅 topic 轮 → 收尾
 check('advanceDream finishes (only topic round)', dbClaim.getDreamLease('win-claim') === null)
 check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 dbClaim.insert({ level: 'fact', content: '待整理的记忆', source_session: 'win-claim' })
-check('startWindowDream: ok', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
-check('startWindowDream: second rejected while running', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
+check('startWindowDream: ok', startWindowDream(ctxClaim, agentClaim, wsClaim, '.dsh-meow') === true)
+check('startWindowDream: second rejected while running', startWindowDream(ctxClaim, agentClaim, wsClaim, '.dsh-meow') === false)
 check('lease set while running', dbClaim.getDreamLease('win-claim') !== null)
 advanceDream(agentClaim, '.dsh-meow') // 原子轮完成 → 推进到 topic 轮
 check('advanceDream advances to topic round', dbClaim.getDreamLease('win-claim')?.group_idx === 1)
@@ -674,28 +712,130 @@ advanceDream(agentClaim, '.dsh-meow') // topic 轮完成 → 收尾
 check('advanceDream finishes after topic round', dbClaim.getDreamLease('win-claim') === null)
 check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 
-// 双版本投递契约（2026-09-10）：第 0 组 followup（另起轮），后续组 steer（连着同轮
-// ——dream 多组不分轮，一个任务一个 turn）。有 followup 也必须走 steer 推进。
+// fork 投递契约：各组独立 caller child，不碰 parent inbox；成功后顺序推进租约。
+{
+  let resolveStart, resolveResult, disposed = 0, reserved
+  const ctxChild = { get: (name) => name === 'subagents' ? { startActivation: (spec) => {
+    reserved = spec.childId
+    return new Promise((r) => { resolveStart = r })
+  } } : undefined }
+  const running = runMemoryChild(ctxChild, {}, 'turn text', 'reflect')
+  check('child identity reserved before asynchronous startup', typeof reserved === 'string' && isOwnedMemoryChild(reserved))
+  noteMemoryChildToolError(reserved)
+  resolveStart({ childId: reserved, result: new Promise((r) => { resolveResult = r }), dispose: async () => { disposed++ } })
+  await Promise.resolve()
+  resolveResult({ stopReason: 'completed' })
+  check('startup tool error prevents reported success', await running === false && disposed === 1 && !isOwnedMemoryChild(reserved))
+  const rejected = runMemoryChild({ get: (name) => name === 'subagents' ? { startActivation: async () => { throw Error('reject') } } : undefined }, {}, 'x', 'reflect')
+  check('rejected start releases reserved identity', await rejected === false)
+  let accept, disposePending = 0
+  const pending = runMemoryChild({ get: (name) => name === 'subagents' ? { startActivation: (spec) => new Promise((r) => { accept = () => r({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => { disposePending++ } }) }) } : undefined }, {}, 'x', 'reflect')
+  const drain = disposeMemoryChildren()
+  accept()
+  await drain
+  check('reload drains late activation and invalidates callback', await pending === false && disposePending === 1)
+}
 {
   const wsDual = mkdtempSync(join(tmpdir(), 'mm-dual-'))
   const dbDual = new MemoryDb(memoryDbPath(wsDual))
   dbDual.touchWindow('win-dual', wsDual, Date.now())
-  dbDual.insert({ level: 'fact', content: '双模式投递的待整理记忆', source_session: 'win-dual' })
-  const fuCalled = []
-  const stCalled = []
-  const agentDual = {
-    session: { header: { id: 'win-dual', cwd: wsDual } },
-    followup: (m) => fuCalled.push(m),
-    steer: (m) => stCalled.push(m),
-  }
-  check('startWindowDream uses followup (standalone turn)', startWindowDream({}, agentDual, wsDual, '.dsh-meow') === true && fuCalled.length === 1 && stCalled.length === 0)
-  advanceDream(agentDual, '.dsh-meow') // 原子轮完成 → 推进到 topic 轮
-  check('advanceDream uses steer (rounds stay in one turn)', fuCalled.length === 1 && stCalled.length === 1 && dbDual.getDreamLease('win-dual')?.group_idx === 1)
-  advanceDream(agentDual, '.dsh-meow') // topic 轮完成 → 收尾
-  check('advanceDream finishes dual-mode dream (heartbeat stopped too)', dbDual.getDreamLease('win-dual') === null && stCalled.length === 1)
+  dbDual.insert({ level: 'fact', content: '子代理整理的待整理记忆', source_session: 'win-dual' })
+  const calls = []
+  const resolves = []
+  const dualCtx = { get: (name) => name === 'subagents' ? { startActivation: async (spec) => {
+    calls.push(spec)
+    return { childId: spec.childId, result: new Promise((r) => resolves.push(r)), dispose: async () => {} }
+  } } : undefined }
+  const agentDual = { session: { header: { id: 'win-dual', cwd: wsDual } }, steer: () => { throw Error('parent steer') }, followup: () => { throw Error('parent followup') } }
+  check('dream fork starts without parent inbox', startWindowDream(dualCtx, agentDual, wsDual, '.dsh-meow', undefined, 2, { provider: 'prov', model: 'memory' }) && calls.length === 1 && calls[0].delivery === 'caller' && calls[0].provider === 'fork' && calls[0].request.parent === agentDual && calls[0].request.agentOptions.model === 'memory')
+  const formerOwner = dbDual.getDreamLease('win-dual').owner
+  dbDual.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, 'win-dual')
+  check('replacement lease claims same T after expiry', dbDual.claimDream('win-dual', 'new-owner', dbDual.getDreamLease('win-dual').T, 30 * 60_000))
+  resolves.shift()({ stopReason: 'completed', output: [] })
+  await new Promise((r) => setTimeout(r, 0))
+  check('old async child cannot advance or finish replacement lease', dbDual.getDreamLease('win-dual')?.owner === 'new-owner' && dbDual.getDreamLease('win-dual')?.group_idx === 0 && calls.length === 1 && dbDual.getWindow('win-dual')?.last_dream_time === null)
+  dbDual.releaseDream('win-dual', 'new-owner')
+  check('old owner differs from replacement', formerOwner !== 'new-owner')
+  check('restart dream after replacement cleanup', startWindowDream(dualCtx, agentDual, wsDual, '.dsh-meow') && calls.length === 2)
+  resolves.shift()({ stopReason: 'completed', output: [] })
+  await new Promise((r) => setTimeout(r, 0))
+  check('dream next group starts only after success', calls.length === 3 && dbDual.getDreamLease('win-dual')?.group_idx === 1)
+  resolves.shift()({ stopReason: 'completed', output: [] })
+  await new Promise((r) => setTimeout(r, 0))
+  check('dream completes after all groups', dbDual.getDreamLease('win-dual') === null && dbDual.getWindow('win-dual')?.last_dream_time !== null)
   dbDual.close()
 }
-check('startWindowDream: ok again after finish', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
+// A topic child can create an atomic memory, shifting the freshly collected round list.
+{
+  const wsShift = mkdtempSync(join(tmpdir(), 'mm-dream-shift-'))
+  const dbShift = new MemoryDb(memoryDbPath(wsShift))
+  const sid = 'win-shift'
+  dbShift.touchWindow(sid, wsShift, Date.now())
+  const prompts = []
+  const resolves = []
+  const ctxShift = { get: (name) => name === 'subagents' ? { startActivation: async (spec) => {
+    prompts.push(spec.request.prompt[0].text)
+    return { childId: spec.childId, result: new Promise((resolve) => resolves.push(resolve)), dispose: async () => {} }
+  } } : undefined }
+  const agentShift = { session: { header: { id: sid, cwd: wsShift } } }
+  check('shift: starts with topic when no atomic rows exist', startWindowDream(ctxShift, agentShift, wsShift, '.dsh-meow') && prompts.length === 1 && prompts[0].includes('第 1/1 组 - topic记忆条目'))
+  dbShift.insert({ level: 'fact', content: '另一会话新增的事实不属于本窗口', source_session: 'other-window' })
+  dbShift.insert({ level: 'fact', content: '话题轮新建待审事实', project: 'shift-project', source_session: sid })
+  resolves.shift()({ stopReason: 'completed' })
+  await new Promise((r) => setTimeout(r, 0))
+  check('shift: new fact is reviewed in atomic child, topic runs only once', prompts.length === 2 && prompts[1].includes('原子记忆条目') && prompts[1].includes('话题轮新建待审事实') && !prompts[1].includes('另一会话新增的事实不属于本窗口') && !prompts[1].includes('topic记忆条目') && dbShift.getDreamLease(sid) !== null, JSON.stringify(prompts.map((p) => p.match(/第 \d+\/\d+ 组 - [^\n]+/)?.[0])))
+  resolves.shift()({ stopReason: 'completed' })
+  await new Promise((r) => setTimeout(r, 0))
+  check('shift: finalizes only after fact review and project summary', prompts.length === 3 && prompts[2].includes('项目总结') && prompts[2].includes('shift-project') && dbShift.getDreamLease(sid) !== null)
+  resolves.shift()({ stopReason: 'completed' })
+  await new Promise((r) => setTimeout(r, 0))
+  check('shift: all semantic rounds complete without repeating topic', prompts.length === 3 && dbShift.getDreamLease(sid) === null && dbShift.getWindow(sid)?.last_dream_time !== null)
+  dbShift.close()
+}
+// A completed atomic round must not hide a fact newly created by the later topic child.
+{
+  const wsLate = mkdtempSync(join(tmpdir(), 'mm-dream-late-'))
+  const dbLate = new MemoryDb(memoryDbPath(wsLate))
+  const sid = 'win-late'
+  dbLate.touchWindow(sid, wsLate, Date.now())
+  dbLate.insert({ level: 'fact', content: '原有事实', source_session: sid })
+  const prompts = []
+  const resolves = []
+  const ctx = { get: (name) => name === 'subagents' ? { startActivation: async (spec) => {
+    prompts.push(spec.request.prompt[0].text)
+    return { childId: spec.childId, result: new Promise((resolve) => resolves.push(resolve)), dispose: async () => {} }
+  } } : undefined }
+  check('late fact: initial atomic starts', startWindowDream(ctx, { session: { header: { id: sid, cwd: wsLate } } }, wsLate) && prompts.length === 1 && prompts[0].includes('原有事实'))
+  resolves.shift()({ stopReason: 'completed' })
+  await new Promise((r) => setTimeout(r, 0))
+  check('late fact: topic follows initial atomic', prompts.length === 2 && prompts[1].includes('topic记忆条目'))
+  dbLate.insert({ level: 'fact', content: '话题新建事实', source_session: sid })
+  resolves.shift()({ stopReason: 'completed' })
+  await new Promise((r) => setTimeout(r, 0))
+  check('late fact: fresh atomic child reviews topic-created fact before finalize', prompts.length === 3 && prompts[2].includes('原子记忆条目') && prompts[2].includes('话题新建事实') && dbLate.getDreamLease(sid) !== null)
+  resolves.shift()({ stopReason: 'completed' })
+  await new Promise((r) => setTimeout(r, 0))
+  check('late fact: catch-up terminates without repeating topic', prompts.length === 3 && dbLate.getDreamLease(sid) === null && dbLate.getWindow(sid)?.last_dream_time !== null)
+  dbLate.close()
+}
+// Repeated atomic insertions must not turn one dream into an unbounded child loop.
+{
+  const wsLoop = mkdtempSync(join(tmpdir(), 'mm-dream-loop-'))
+  const dbLoop = new MemoryDb(memoryDbPath(wsLoop))
+  const sid = 'win-loop'
+  dbLoop.touchWindow(sid, wsLoop, Date.now())
+  let calls = 0
+  const ctx = { get: (name) => name === 'subagents' ? { startActivation: async (spec) => {
+    calls++
+    dbLoop.insert({ level: 'fact', content: `child-created-${calls}`, source_session: sid })
+    return { childId: spec.childId, result: Promise.resolve({ stopReason: 'completed' }), dispose: async () => {} }
+  } } : undefined }
+  check('loop: dream starts', startWindowDream(ctx, { session: { header: { id: sid, cwd: wsLoop } } }, wsLoop))
+  await new Promise((r) => setTimeout(r, 50))
+  check('loop: repeated new facts stop within bounded children without false stamp', calls <= 6 && dbLoop.getDreamLease(sid) === null && dbLoop.getWindow(sid)?.last_dream_time === null, `calls=${calls}`)
+  dbLoop.close()
+}
+check('startWindowDream: ok again after finish', startWindowDream(ctxClaim, agentClaim, wsClaim, '.dsh-meow') === true)
 // 模拟中断：start 后不 advance（如同进程崩溃/重载），租约过期后补收尾恢复
 dbClaim.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, 'win-claim')
 const nRecover = recoverInterruptedDream(dbClaim, 'win-claim', wsClaim, '.dsh-meow')
@@ -703,61 +843,32 @@ check('recoverInterruptedDream clears lease', dbClaim.getDreamLease('win-claim')
 // abortDream 立即收尾（用户中止）
 dbClaim.insert({ level: 'fact', content: '中止用记忆', source_session: 'win-claim' })
 dbClaim.touchWindow('win-claim', wsClaim, Date.now())
-startWindowDream({}, agentClaim, wsClaim, '.dsh-meow')
+startWindowDream(ctxClaim, agentClaim, wsClaim, '.dsh-meow')
 abortDream(agentClaim, '.dsh-meow')
 check('abortDream finalizes immediately', dbClaim.getDreamLease('win-claim') === null && dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 dbClaim.close()
 
-// steer 抛错兜底（2026-09-10，dsh 0.1.5 实测事故回归）：0.1.5 起 agent 的 inbox
-// 从内存对象改成 session projection，投影未激活时 steer 直接抛
-// "cannot read inbox state: its projection registration is not active"；
-// dream 调用点在 setInterval 里，未捕获异常会把整个 dsh 进程带走。
-// 修复=safeSteer 兜底 + 释放租约 + 返回 false（下个周期自然重试）。
-const wsSteerFail = mkdtempSync(join(tmpdir(), 'mm-steer-fail-'))
+// 子代理启动失败：没有 fallback 主会话投递，也不留下租约。
+const wsSteerFail = mkdtempSync(join(tmpdir(), 'mm-child-fail-'))
 const dbSteerFail = new MemoryDb(memoryDbPath(wsSteerFail))
 dbSteerFail.touchWindow('win-steer-fail', wsSteerFail, Date.now())
-dbSteerFail.insert({ level: 'fact', content: 'steer 兜底用例', source_session: 'win-steer-fail' })
-const agentThrows = {
-  session: { header: { id: 'win-steer-fail', cwd: wsSteerFail } },
-  steer: () => {
-    throw new Error('agent "win-steer-fail" cannot read inbox state: its projection registration is not active')
-  },
-}
-check('startWindowDream: steer throw → returns false, does not crash', startWindowDream({}, agentThrows, wsSteerFail, '.dsh-meow') === false)
-check('startWindowDream: steer throw → lease released for retry', dbSteerFail.getDreamLease('win-steer-fail') === null)
-const steeredSteerOk = []
-const agentSteerOk = { session: { header: { id: 'win-steer-fail', cwd: wsSteerFail } }, steer: (m) => steeredSteerOk.push(m) }
-check(
-  'startWindowDream: normal steer still starts after a failed attempt',
-  startWindowDream({}, agentSteerOk, wsSteerFail, '.dsh-meow') === true && steeredSteerOk.length === 1,
-)
+dbSteerFail.insert({ level: 'fact', content: '启动失败后仍待整理', source_session: 'win-steer-fail' })
+const agentThrows = { session: { header: { id: 'win-steer-fail', cwd: wsSteerFail } }, steer: () => { throw Error('parent must not steer') }, followup: () => { throw Error('parent must not followup') } }
+const startFail = { get: (name) => name === 'subagents' ? { startActivation: async () => { throw Error('child startup unavailable') } } : undefined }
+check('dream startup child failure does not throw into parent', startWindowDream(startFail, agentThrows, wsSteerFail, '.dsh-meow') === true)
+await new Promise((r) => setTimeout(r, 0))
+check('dream startup child failure releases lease without stamp', dbSteerFail.getDreamLease('win-steer-fail') === null && dbSteerFail.getWindow('win-steer-fail')?.last_dream_time === null)
+check('missing subagents never falls back to parent', startWindowDream({}, agentThrows, wsSteerFail, '.dsh-meow') === false)
 dbSteerFail.close()
 
-// 跨实例推进（原「孤儿收尾」）：状态在 DB 租约，任何实例的 turn-stopping 都能推进/收尾
+// 残留租约的兼容回收：不向父会话续发后续轮；过期后按失败重试处理。
 const wsOrphan = mkdtempSync(join(tmpdir(), 'mm-orphan-'))
 const dbOrphan = new MemoryDb(memoryDbPath(wsOrphan))
 dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
 dbOrphan.insert({ level: 'fact', content: '孤儿窗口的记忆', source_session: 'win-orphan' })
-dbOrphan.claimDream('win-orphan', 'residual-fiber', Date.now(), 60_000) // 模拟残留 fiber start 写了租约
-advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow') // 原子轮 → topic 轮
-advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow') // topic 轮 → 收尾
-check('orphan dream finalized by advanceDream', dbOrphan.getDreamLease('win-orphan') === null &&
-  dbOrphan.getWindow('win-orphan')?.last_dream_time !== null)
-// 多轮推进：原子轮 → topic 轮 → 项目总结轮——advanceDream 逐轮 steer，最后一轮收尾
-dbOrphan.insert({ level: 'fact', content: '第二组记忆', source_session: 'win-orphan', project: 'p2' })
-dbOrphan.insert({ level: 'topic', content: '孤儿话题内容', title: '孤儿T', source_session: 'win-orphan' })
-dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
-let steeredMsg = null
-const agent2 = { session: { header: { id: 'win-orphan', cwd: wsOrphan } }, steer: (m) => { steeredMsg = m } }
-startWindowDream({}, agent2, wsOrphan, '.dsh-meow')
-check('lease group_idx 0 after start', dbOrphan.getDreamLease('win-orphan')?.group_idx === 0)
-advanceDream(agent2, '.dsh-meow')
-check('advanceDream advances to topic round + steers', dbOrphan.getDreamLease('win-orphan')?.group_idx === 1 && steeredMsg !== null)
-advanceDream(agent2, '.dsh-meow')
-const steeredText = steeredMsg !== null && Array.isArray(steeredMsg?.content) ? steeredMsg.content.map((b) => (b.type === 'text' ? b.text : '')).join('') : ''
-check('advanceDream advances to project-summary round (p2)', dbOrphan.getDreamLease('win-orphan')?.group_idx === 2 && steeredText.includes('本组涉及的项目：p2'))
-advanceDream(agent2, '.dsh-meow')
-check('advanceDream finalizes after last round', dbOrphan.getDreamLease('win-orphan') === null)
+dbOrphan.claimDream('win-orphan', 'residual-fiber', Date.now(), 60_000)
+dbOrphan.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, 'win-orphan')
+check('orphan zero-progress lease recovered without stamping', recoverInterruptedDream(dbOrphan, 'win-orphan', wsOrphan, '.dsh-meow') === 0 && dbOrphan.getDreamLease('win-orphan') === null && dbOrphan.getWindow('win-orphan')?.last_dream_time === null)
 dbOrphan.close()
 
 
@@ -797,9 +908,9 @@ dbR.close()
 const wsIcon = mkdtempSync(join(tmpdir(), 'mm-icon-'))
 const dbIcon = new MemoryDb(memoryDbPath(wsIcon))
 dbIcon.touchWindow('s-dreamed', wsIcon, Date.now() - 1000)
-dbIcon.finishDream('s-dreamed', Date.now() - 500) // dream 过且之后无活动
+dbIcon.finishDream('s-dreamed', null, Date.now() - 500) // dream 过且之后无活动
 dbIcon.touchWindow('s-active', wsIcon, Date.now() - 3000)
-dbIcon.finishDream('s-active', Date.now() - 2000)
+dbIcon.finishDream('s-active', null, Date.now() - 2000)
 dbIcon.touchWindow('s-active', wsIcon, Date.now() - 1000) // dream 后有新活动
 dbIcon.touchWindow('s-nodream', wsIcon, Date.now()) // 从未 dream
 dbIcon.touchWindow('s-dreaming', wsIcon, Date.now() - 4000)
@@ -930,6 +1041,13 @@ const db3 = new MemoryDb(memoryDbPath(ws3))
 db3.insert({ level: 'topic', content: '【起因】重构记忆插件【经过】设计讨论【结果】未定', title: 'meow-memory 重构', goal: '让记忆插件 v2 上线' })
 const msg = buildReflectMessage(ws3, '我们讨论一下猫眼插件的模型部署', '.dsh-meow')
 const txt = msg.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
+check('reflect fork prompt carries current turn content', txt.includes('我们讨论一下猫眼插件的模型部署'))
+check('scanTurn includes bounded tool result evidence', scanTurn([
+  { type: 'turn/start' },
+  { type: 'user/message', data: { content: [{ type: 'text', text: 'investigate DB bug' }] } },
+  { type: 'tool/result', data: { message: { content: [{ type: 'text', text: 'SQLite constraint mismatch root cause' }] } } },
+]).turnText.includes('SQLite constraint mismatch root cause'))
+check('reflect fork prompt bounds current turn', buildReflectMessage(ws3, 'X'.repeat(30000), '.dsh-meow').content[0].text.length < 20000)
 check('reflect message sections', txt.includes('记忆反思任务') && txt.includes('【一】') && txt.includes('【二】') && txt.includes('【三】'))
 check('reflect update rules', txt.includes('信息已经过时') && txt.includes('标 stale') && txt.includes('关键词不准'))
 check('reflect project list + new project check', txt.includes('已有的 project') && txt.includes('请添加新 project 的记忆'))
@@ -952,6 +1070,7 @@ function makeCtx(subagents) {
   const tools = []
   const handlers = {}
   const effects = []
+  const subagentService = subagents ?? { start: () => { throw new Error('subagents not expected in tests') } }
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: console.error },
     tools: { register: (t) => tools.push(t) },
@@ -962,12 +1081,12 @@ function makeCtx(subagents) {
       if (typeof disposer === 'function') allEffectDisposers.push(disposer)
       return disposer
     },
-    subagents: subagents ?? { start: () => { throw new Error('subagents not expected in tests') } },
+    get: (name) => name === 'subagents' ? subagentService : undefined,
   }
   return { ctx, tools, handlers, effects }
 }
 
-const { ctx, tools, handlers } = makeCtx()
+const { ctx, tools, handlers } = makeCtx({ startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) })
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('eight tools registered', tools.length === 8 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_home']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
@@ -1013,7 +1132,7 @@ check('eight tools registered', tools.length === 8 && ['memory_remember', 'memor
   const mainExec = { agent: { session: { header: { cwd: wsT, id: 'win-main-tool' } }, steer: () => {} } }
   const rMainTool = await dreamToolT.execute({}, mainExec)
   check('memory_dream tool allows main window (dream starts, topic round)', rMainTool.ok === true && dbT.getDreamLease('win-main-tool') !== null, JSON.stringify(rMainTool))
-  dbT.finishDream('win-main-tool', Date.now()) // 清理：收尾不留悬挂租约
+  dbT.finishDream('win-main-tool', dbT.getDreamLease('win-main-tool')?.owner ?? null, Date.now()) // 清理：收尾不留悬挂租约
   dbT.close()
   rmSync(wsT, { recursive: true, force: true })
 }
@@ -1711,7 +1830,8 @@ check('fork session (parentSession without origin) still injects', decisionFork.
   decisionFork.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   decisionFork.messages[1] === forkMsg && decisionFork.messages[1].content[0].text === 'fork 会话的首条消息')
 
-// turn-stopping 反思（单任务内连续工具 step ≥7 才触发——用户拍板语义）
+const reflectCalls = []
+ctx.get('subagents').startActivation = async (spec) => { reflectCalls.push(spec); return { childId: spec.childId, result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } }
 const stopping = handlers['agent/turn-stopping']
 check('turn-stopping registered', typeof stopping === 'function')
 
@@ -1720,13 +1840,13 @@ const sevenSteps = [events.turnStart(), events.userMsg('干活'), ...Array.from(
 const steered = []
 const agentD = { session: { header: { cwd: ws, id: 's4' }, events: sevenSteps }, steer: (m) => steered.push(m) }
 stopping({ agent: agentD, turn: 1, signal: new AbortController().signal })
-check('steer after 7 consecutive tool steps', steered.length === 1 && steered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+check('fork after 7 consecutive tool steps', reflectCalls.length === 1 && reflectCalls[0].request.prompt[0].text.includes('记忆反思') && steered.length === 0)
 
 // alpha.4 形态：事件流由 ownEvents() 提供，反射链路必须等价（7 步触发）。
 const steeredA4 = []
 const agentA4 = { session: { header: { cwd: ws, id: 's4a' }, ownEvents: () => sevenSteps }, steer: (m) => steeredA4.push(m) }
 stopping({ agent: agentA4, turn: 1, signal: new AbortController().signal })
-check('alpha.4 ownEvents session steers after 7 consecutive tool steps', steeredA4.length === 1 && steeredA4[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+check('alpha.4 ownEvents session forks after 7 consecutive tool steps', reflectCalls.length === 2 && steeredA4.length === 0)
 
 // 单步工具调用 → 不触发
 const steered1 = []
@@ -1749,9 +1869,9 @@ const agent19 = { session: { header: { cwd: ws, id: 's19' }, events: sevenSteps 
 stopping({ agent: agent19, turn: 41, signal: new AbortController().signal })
 stopping({ agent: agent19, turn: 41, signal: new AbortController().signal })
 stopping({ agent: agent19, turn: 41, signal: new AbortController().signal })
-check('issue#19 同 turn 收尾窗口内只排一条反思', steered19.length === 1, `got ${steered19.length}`)
+check('issue#19 same turn starts only one child', reflectCalls.length === 3 && steered19.length === 0, `got ${reflectCalls.length}`)
 stopping({ agent: agent19, turn: 42, signal: new AbortController().signal })
-check('issue#19 换 turn 后放行（不是永久闩）', steered19.length === 2, `got ${steered19.length}`)
+check('issue#19 next turn allows another child', reflectCalls.length === 4, `got ${reflectCalls.length}`)
 const steered19b = []
 const agent19b = {
   session: {
@@ -1831,113 +1951,51 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   check('factory default: 未知 sub/key → undefined', factoryDefaultOf({ key: 'nope', sub: 'dream' }) === undefined && factoryDefaultOf({ key: 'enabled', sub: 'nope' }) === undefined)
 }
 
-// 反思永远 steer（v0.24 拍板：独立执行移除，配置了 model 也不 fork）
+// Fork task contract: memory work has its own child turn, never a parent followup/steer.
 {
-  const calls = []
-  const d = makeCtx({ start: (name, req) => { calls.push({ name, req }); return { id: 'c', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } } })
+  const starts = []
+  let settleReflect
+  const d = makeCtx({ startActivation: async (spec) => { starts.push(spec); return { childId: spec.childId, result: new Promise((r) => { settleReflect = r }), dispose: async () => {} } } })
   await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
-  const dSteered = []
-  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-steer-always' }, events: sevenSteps }, steer: (m) => dSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
-  check('reflect: always steered even with model configured', dSteered.length === 1 && dSteered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
-  check('reflect: fork subagents never started', calls.length === 0)
+  const forbidden = () => { throw Error('parent inbox must remain untouched') }
+  const parent = { session: { header: { cwd: ws, id: 's-fork-reflect' }, events: sevenSteps }, steer: forbidden, followup: forbidden }
+  d.handlers['agent/turn-stopping']({ agent: parent, turn: 1, signal: new AbortController().signal })
+  await new Promise((r) => setTimeout(r, 0))
+  check('reflect: fork caller delivery and child-only model', starts.length === 1 && starts[0].provider === 'fork' && starts[0].delivery === 'caller' && starts[0].request.parent === parent && starts[0].request.agentOptions.provider === 'prov' && starts[0].request.agentOptions.model === 'main' && starts[0].request.prompt[0].text.includes('记忆反思'))
+  check('reflect: parent has no model request hook', d.handlers['agent/request'] === undefined)
+  d.handlers['agent/turn-stopping']({ agent: parent, turn: 1, signal: new AbortController().signal })
+  check('reflect: same-turn dedup', starts.length === 1)
+  const child = { session: { header: { id: starts[0].childId, cwd: ws, origin: 'subagent', parentSession: 's-fork-reflect' } } }
+  const own = d.handlers['session/event']
+  own(child.session, { type: 'turn/start', time: Date.now() })
+  own(child.session, { type: 'tool/result', data: { message: { isError: true } }, time: Date.now() })
+  check('reflect: owned child recognized by event listener', isOwnedMemoryChild(child.session.header.id))
+  settleReflect({ stopReason: 'completed', output: [] })
+  await new Promise((r) => setTimeout(r, 0))
+  check('reflect: child DB tool error remains a failure signal', starts.length === 1 && !isOwnedMemoryChild(child.session.header.id))
 }
 
-// 换模型（v0.24）：agent/request waterfall 在反思/梦境轮覆盖 provider/model，其余请求放行
+// Fiber disposal must wait for a child whose startup publishes after teardown begins.
+{
+  let accept, reserved, released = 0
+  const d = makeCtx({ startActivation: (spec) => {
+    reserved = spec.childId
+    return new Promise((r) => { accept = () => r({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => { released++ } }) })
+  } })
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-reload-reflect' }, events: sevenSteps } }, turn: 7 })
+  check('reload race: reflect child reserved', isOwnedMemoryChild(reserved))
+  const teardown = d.effects.at(-1)()
+  accept()
+  await teardown
+  check('reload race: child drained before DB close', released === 1 && !isOwnedMemoryChild(reserved))
+}
+
+  // model override 不得修改主会话路由；只在 fork 子代理 request.agentOptions 上生效
 {
   const d = makeCtx()
   await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
-  const reqHandler = d.handlers['agent/request']
-  check('model override: agent/request waterfall registered when model set', typeof reqHandler === 'function')
-  const seed = async () => ({ provider: 'base', model: 'base-model' })
-  // 反思轮（turn 内带 [meow-memory-reflect] 指令消息）→ 覆盖
-  const reflectEvents = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-reflect] 反思任务' }] } }]
-  const out1 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-1' }, events: reflectEvents } }, turn: 1, step: 1, signal: new AbortController().signal }, seed)
-  check('model override: reflect turn swaps provider+model', out1.provider === 'prov' && out1.model === 'main', JSON.stringify(out1))
-  // 梦境轮 → 覆盖
-  const dreamEvents = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 梦境整理' }] } }]
-  const out2 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-2' }, events: dreamEvents } }, turn: 2, step: 1, signal: new AbortController().signal }, seed)
-  check('model override: dream turn swaps model', out2.provider === 'prov' && out2.model === 'main')
-  // 普通对话轮 → 原样放行（自动换回主模型的形态）
-  const out3 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-3' }, events: [events.turnStart(), events.userMsg('你好')] } }, turn: 3, step: 1, signal: new AbortController().signal }, seed)
-  check('model override: normal turn untouched', out3.provider === 'base' && out3.model === 'base-model')
-  // 用户消息引用标记文本 → 不误伤（source.kind='user' 绝不判 marker）
-  const out4 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-4' }, events: [events.turnStart(), events.userMsg('帮我看看 [meow-memory-dream] 这个标记是什么')] } }, turn: 4, step: 1, signal: new AbortController().signal }, seed)
-  check('model override: user-quoted marker not overridden', out4.provider === 'base' && out4.model === 'base-model')
-  // 子代理请求 → 不覆盖
-  const out5 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-5', origin: 'subagent' }, events: reflectEvents } }, turn: 5, step: 1, signal: new AbortController().signal }, seed)
-  check('model override: subagent request untouched', out5.provider === 'base' && out5.model === 'base-model')
-  // 宿主真实顺序：pre-step 先领取整理消息，agent/request 先选模型，随后才 append user/message。
-  const dFirst = makeCtx()
-  await apply(dFirst.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/memory' } })
-  const firstAgent = { session: { header: { cwd: ws, id: 's-first-route' }, events: [events.turnStart()] } }
-  const directive = { source: { kind: 'plugin:meow-memory' }, content: [{ type: 'text', text: '[meow-memory-reflect] 整理' }] }
-  await dFirst.handlers['agent/pre-step']({ agent: firstAgent, turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [directive] }))
-  const firstRoute = await dFirst.handlers['agent/request']({ agent: firstAgent, turn: 1, step: 1 }, seed)
-  check('model override: first request before directive is logged', firstRoute.provider === 'prov' && firstRoute.model === 'memory', JSON.stringify(firstRoute))
-  const inherited = async () => ({ ...firstRoute })
-  // 后续工具步骤维持快照；新 turn 不继承。
-  firstAgent.session.events.push({ type: 'user/message', data: directive })
-  await dFirst.handlers['agent/pre-step']({ agent: firstAgent, turn: 1, step: 2, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [] }))
-  const laterRoute = await dFirst.handlers['agent/request']({ agent: firstAgent, turn: 1, step: 2 }, seed)
-  check('model override: subsequent request retains task model', laterRoute.model === 'memory')
-  firstAgent.session.events.push(events.turnStart())
-  const nextRoute = await dFirst.handlers['agent/request']({ agent: firstAgent, turn: 2, step: 1 }, inherited)
-  check('model override: next turn restores main model from inherited route', nextRoute.provider === 'base' && nextRoute.model === 'base-model', JSON.stringify(nextRoute))
-  // 插件热重载后内存快照丢失：从会话历史中最后一个整理 turn 之前的请求头恢复。
-  const dReload = makeCtx()
-  await apply(dReload.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/memory' } })
-  const resumedAgent = { session: { header: { cwd: ws, id: 's-reload-route' }, events: [
-    events.turnStart(), { type: 'request/header', data: { header: { config: { provider: 'base', model: 'base-model' } } } },
-    { type: 'turn/end', data: {} }, events.turnStart(), { type: 'user/message', data: directive },
-    { type: 'request/header', data: { header: { config: { provider: 'prov', model: 'memory' } } } },
-    { type: 'turn/end', data: {} }, events.turnStart(),
-  ] } }
-  const restoredAfterReload = await dReload.handlers['agent/request']({ agent: resumedAgent, turn: 3, step: 1 }, inherited)
-  check('model override: reload restores route from prior non-memory header', restoredAfterReload.provider === 'base' && restoredAfterReload.model === 'base-model', JSON.stringify(restoredAfterReload))
-  // 同轮插话只跳过该用户步骤；梦境下一组仍沿用整理模型。
-  const dreamAgent = { session: { header: { cwd: ws, id: 's-dream-route' }, events: [events.turnStart()] } }
-  const dreamDirective = { source: { kind: 'plugin:meow-memory' }, content: [{ type: 'text', text: '[meow-memory-dream] 第一组' }] }
-  const runPre = (agent, turn, step, messages) => dFirst.handlers['agent/pre-step'](
-    { agent, turn, step, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages }))
-  const runReq = (agent, turn, step, next = seed) => dFirst.handlers['agent/request']({ agent, turn, step }, next)
-  await runPre(dreamAgent, 1, 1, [dreamDirective])
-  const dreamFirstRoute = await runReq(dreamAgent, 1, 1)
-  check('model override: dream first request', dreamFirstRoute.model === 'memory')
-  dreamAgent.session.events.push({ type: 'user/message', data: dreamDirective })
-  await runPre(dreamAgent, 1, 2, [{ source: { kind: 'user' }, content: [{ type: 'text', text: '插话' }] }])
-  const interruptedRoute = await runReq(dreamAgent, 1, 2, async () => ({ ...dreamFirstRoute }))
-  check('model override: user interruption restores main from inherited route', interruptedRoute.provider === 'base' && interruptedRoute.model === 'base-model', JSON.stringify(interruptedRoute))
-  await runPre(dreamAgent, 1, 3, [])
-  check('model override: user tool continuation stays main', (await runReq(dreamAgent, 1, 3, async () => ({ ...interruptedRoute }))).model === 'base-model')
-  await runPre(dreamAgent, 1, 4, [{ source: { kind: 'plugin:meow-memory' }, content: [{ type: 'text', text: '[meow-memory-dream] 第二组' }] }])
-  check('model override: subsequent dream group retains model', (await runReq(dreamAgent, 1, 4)).model === 'memory')
-  await runPre(dreamAgent, 1, 5, [dreamDirective, { source: { kind: 'user' }, content: [{ type: 'text', text: '同批插话' }] }])
-  check('model override: mixed user and directive stays main', (await runReq(dreamAgent, 1, 5)).model === 'base-model')
-  // 设置页源从空值热改为专有模型，当前任务不变，新任务生效。
-  let userLayer = { delegate: { model: '' } }
-  const dHot = makeCtx()
-  const settingsSvc = { installSection: (_owner, _ns, _schema, _entry, hooks) => { hooks.setSource(() => userLayer); return () => {} } }
-  dHot.ctx.get = (name) => name === 'settings' ? settingsSvc : undefined
-  dHot.ctx.inject = (_deps, cb) => { queueMicrotask(() => cb({ settings: settingsSvc, effect: dHot.ctx.effect })) }
-  await apply(dHot.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: '' } })
-  const hotAgent = { session: { header: { cwd: ws, id: 's-hot-route' }, events: [events.turnStart()] } }
-  const hotPre = (turn) => dHot.handlers['agent/pre-step']({ agent: hotAgent, turn, step: 1, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [directive] }))
-  const hotReq = (turn) => dHot.handlers['agent/request']({ agent: hotAgent, turn, step: 1 }, seed)
-  await hotPre(1)
-  userLayer = { delegate: { model: 'other/new-model' } }
-  check('model override: active task retains blank snapshot', (await hotReq(1)).model === 'base-model')
-  hotAgent.session.events.push(events.turnStart())
-  await hotPre(2)
-  const hotRoute = await hotReq(2)
-  check('model override: next task reads updated settings', hotRoute.provider === 'other' && hotRoute.model === 'new-model', JSON.stringify(hotRoute))
-  userLayer = { delegate: { model: '' } }
-  hotAgent.session.events.push(events.turnStart())
-  await hotPre(3)
-  check('model override: clearing settings restores main model', (await hotReq(3)).model === 'base-model')
-  // 空配置仍注册钩子，以便设置页热改后下一整理任务生效。
-  const d2 = makeCtx()
-  await apply(d2.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
-  check('model override: no model still registers pass-through waterfall', typeof d2.handlers['agent/request'] === 'function')
+  check('model override: no parent agent/request waterfall', d.handlers['agent/request'] === undefined)
 }
 
 // isMemoryTaskTurn 单元：跨 turn 边界（marker 只认当前 turn，上一轮的 marker 不残留）
@@ -1952,7 +2010,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
 
 // 定义形状 + handler 全路径。语义=手动触发：直接 startWindowDream，不吃峰时抑制/空闲检查。
 {
-  const def = dreamCommandDefinition({ logger: { info: () => {}, warn: () => {}, error: () => {} } }, '.dsh-meow')
+  const def = dreamCommandDefinition({ get: (name) => name === 'subagents' ? { startActivation: async (spec) => ({ childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }) } : undefined, logger: { info: () => {}, warn: () => {}, error: () => {} } }, '.dsh-meow')
   check('/dream command shape', def.name === 'dream' && typeof def.description === 'string' && def.description.length > 0)
 
   // 成功路径：本窗口有记忆 → steer 发出第 1 组 + 租约建立 + success 文案
@@ -1963,12 +2021,12 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   const agentC = { session: { header: { cwd: wsCmd, id: 's-cmd' } }, steer: (m) => steeredC.push(m) }
   const r1 = await def.handler({ agent: agentC })
   check('/dream starts window dream', r1.kind === 'success' && r1.text.includes('已触发'), JSON.stringify(r1))
-  check('/dream steers round 1 with marker', steeredC.length === 1 && JSON.stringify(steeredC[0]).includes('[meow-memory-dream]'))
+  check('/dream forks round 1 without parent steer', steeredC.length === 0 && dbCmd.getDreamLease('s-cmd') !== null)
   check('/dream claims lease', dbCmd.getDreamLease('s-cmd') !== null)
   // 占用中：第二次调用 → error 且不重复 steer
   const r2 = await def.handler({ agent: agentC })
   check('/dream busy → error', r2.kind === 'error' && r2.text.includes('进行中'), JSON.stringify(r2))
-  check('/dream busy no extra steer', steeredC.length === 1)
+  check('/dream busy no parent steer', steeredC.length === 0)
   abortDream(agentC, '.dsh-meow')
 
   // 空窗口：topic 轮恒触发（回顾建新）→ 也成功启动（与 memory_dream 工具行为一致）
@@ -1978,7 +2036,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   const steeredE = []
   const agentE2 = { session: { header: { cwd: wsEmpty, id: 's-empty' } }, steer: (m) => steeredE.push(m) }
   const rNone = await def.handler({ agent: agentE2 })
-  check('/dream empty window still starts (topic round)', rNone.kind === 'success' && steeredE.length === 1, JSON.stringify(rNone))
+  check('/dream empty window still starts (topic round)', rNone.kind === 'success' && steeredE.length === 0 && dbEmpty.getDreamLease('s-empty') !== null, JSON.stringify(rNone))
   abortDream(agentE2, '.dsh-meow')
 
   // 守卫：子代理会话拒绝
@@ -2047,8 +2105,7 @@ function makeSettingsCtx(userLayer) {
     tools: { register: (t) => tools.push(t) },
     on: () => {},
     effect: () => () => {},
-    subagents: { start: () => { throw new Error('subagents not expected in tests') } },
-    get: (n) => (n === 'settings' ? settingsSvc : undefined),
+    get: (n) => n === 'settings' ? settingsSvc : undefined,
     // 与真 cordis 一致：回调**不同步**执行（下一拍微任务才跑）
     inject: (_deps, cb) => { queueMicrotask(() => cb({ settings: settingsSvc, effect: ctx.effect })) },
   }

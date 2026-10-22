@@ -31,6 +31,7 @@ import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, 
 import { CONFIG_DEFAULTS } from './defaults.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
 import { migrationCommandDefinition, SessionMigrationCoordinator } from './migration-coordinator.js'
+import { TaskJournal, registerTaskMetadataRoute } from './task-journal.js'
 
 import {
   abortDream,
@@ -40,7 +41,12 @@ import {
   dreamCommandDefinition,
   dreamTool,
   disposeDreamHeartbeats,
+  disposeMemoryChildren,
+  setMemoryTaskJournal,
   handleMemoryTurnFailure,
+  isOwnedMemoryChild,
+  noteMemoryChildToolError,
+  runMemoryChild,
   noteActivity,
   registerLiveAgent,
   scheduleDream,
@@ -1158,6 +1164,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   if (sweptHome.swept.length > 0 || sweptHome.rotated) {
     perf(`home-log sweep: ${sweptHome.swept.join(',') || '-'}${sweptHome.rotated ? ' +perf.log->old' : ''}`)
   }
+  const taskJournal = new TaskJournal(() => join(activeHomeDir(), 'tasks'))
+  setMemoryTaskJournal(taskJournal, ctx)
   // Restore the file-backed index synchronously; opening all historical workspace
   // databases during apply could block startup (and upgrade unrelated databases).
   loadWindowIndex(resolved.projectDir, undefined, false)
@@ -1179,10 +1187,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).inject ? '此窗口已停止读入记忆（记忆参与开关）：注入与检索均已关闭。' : null
     },
-    refuseWrite: (ws, sid) => {
+    refuseWrite: (ws, sid, childId) => {
       if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：写入被拒绝。'
       if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
-      if (isPluginTurn.get(sid) === true) return null // 整理轮豁免：整理轮写入跟随整理档（#38 联动）
+      if (isPluginTurn.get(sid) === true || (childId !== null && isOwnedMemoryChild(childId))) return null // 仅自有记忆子代理豁免
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).write ? '此窗口已停止写入记忆（记忆参与开关）。' : null
     },
   })
@@ -1206,7 +1214,14 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       }
     }
   }
-  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))
+  const currentMemorySpec = (): AgentOptionsSpec | undefined => {
+    try {
+      return resolveConfig(mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)).delegate.modelSpec
+    } catch {
+      return resolved.delegate.modelSpec
+    }
+  }
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled, currentMemorySpec))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
@@ -1264,6 +1279,11 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const t = event?.type
     const sid = session?.id
     const cwd = session?.header?.cwd
+    if (typeof sid === 'string' && session?.header?.origin === 'subagent' && isOwnedMemoryChild(sid)) {
+      taskJournal.recordChildEvent(sid, event as { type?: string; data?: { message?: { isError?: boolean } } })
+      if (t === 'tool/result' && (event.data as { message?: { isError?: boolean } } | undefined)?.message?.isError === true) noteMemoryChildToolError(sid)
+    }
+    if (session?.header?.origin === 'subagent' && t !== 'compaction/start' && t !== 'compaction/summary' && t !== 'compaction/end') return // 子代理不进窗口表；压缩信号维持原语义
     // 压缩信号：会话历史被压缩（内容已不在上下文）→ 释放本会话已见记录，
     // 允许之前注入/检索过的记忆被再次命中提取。
     if (t === 'compaction/summary' || t === 'compaction/start') {
@@ -1334,7 +1354,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       //    （dream 任务被 claim 后未及落盘就装配崩溃的形状；窗口此刻非活跃使用场景，
       //    误判代价仅为提前重试一次）。
       if (t === 'turn/end') memoryRoutes.delete(sid)
-      if (t === 'turn/end' && (event.data as { reason?: { kind?: string } } | undefined)?.reason?.kind === 'error') {
+      if (t === 'turn/end' && session?.header?.origin !== 'subagent' && (event.data as { reason?: { kind?: string } } | undefined)?.reason?.kind === 'error') {
         const pluginTurn = isPluginTurn.get(sid) === true
         const nakedTurn = turnHadMessage.get(sid) === false // turn/start 已见、其后零消息
         if ((pluginTurn || nakedTurn) && typeof cwd === 'string' && existsSync(memoryDbPath(cwd, resolved.projectDir))) {
@@ -1365,13 +1385,6 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     persistWindowIndex() // 窗口索引落盘（热重载/重启后恢复）
   })
 
-  const currentMemorySpec = (): AgentOptionsSpec | undefined => {
-    try {
-      return resolveConfig(mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)).delegate.modelSpec
-    } catch {
-      return resolved.delegate.modelSpec
-    }
-  }
   const pendingMemoryMessage = (messages: readonly { source?: unknown; content?: Array<{ type?: string; text?: string }> }[]): boolean =>
     messages.some((m) => isMeowSource(m.source) && (m.content ?? []).some((b) => b.type === 'text' &&
       (b.text?.includes(REFLECT_MARKER) || b.text?.includes(DREAM_MARKER))))
@@ -1606,23 +1619,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     }
     // 用户按停止（aborted/interrupted）：不反思、不推进下一组；但 dream 轮必须立即收尾，
     // 否则 DB 租约残留，窗口要等租约过期（30min）才能再 dream。
-    if (endReason === 'aborted' || endReason === 'interrupted') {
-      if (dreamTurn) abortDream(agent, resolved.projectDir, signalDreamState)
-      return
-    }
-    if (dreamTurn) {
-      if (endReason === 'error') {
-        // steer 模式 dream 轮执行失败（LLM/网络瞬态故障，非用户中止）：释放租约不封存，
-        // 下个检查周期自动重试（与 delegate 路径 done 回调的 error 分支同语义，
-        // 2026-09-05 教训：封存会让一次断网永久吞掉窗口的 dream）。
-        try {
-          if (wsTs && sidTs) getDb(wsTs, resolved.projectDir).releaseDream(sidTs)
-        } catch { /* 释放失败不阻塞（租约 30min 过期自愈兜底） */ }
-        return
-      }
-      advanceDream(agent, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays) // dream 轮：推进下一组或收尾（含孤儿收尾）
-      return
-    }
+    if (endReason === 'aborted' || endReason === 'interrupted') return // 子任务生命周期由 fork 管理，不中止父轮租约
+    if (dreamTurn) return // 旧主会话整理轮不再推进；新整理任务只在 fork 子代理中执行
 
     // 窗口/工作区整理门控（issue #38/#28）：「跳过整理」或工作区停用 → 自动反思一并
     // 挡下（手动 /dream 不受限，手动=明确意愿）。dream 轮推进在上方分支已处理，不受此守卫影响。
@@ -1647,59 +1645,24 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
     if (consecutiveToolSteps(sessionEventsOf(agent.session)) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
-    // 反思任务送主会话独立新轮（v0.24 拍板进主会话；2026-09-10 起走 followup 另起
-    // 一轮——steer 延续同 turn 会把 AI 的工作汇报顶成中间步骤，见 sendMemoryTurn）。
-    // 换模型由下方 agent/request waterfall 承接——本 turn 带 REFLECT_MARKER 时自动覆盖模型。
-    if (sendMemoryTurn(agent, message, ws, resolved.projectDir, `reflect sid=${shortSessionId(sidTs)}`)) {
-      if (turn !== undefined) {
-        reflectQueuedTurn.set(sidTs, turn)
-        // 进程级 Map 兜底上限：只保最近 MAX_REFLECT_TRACKED 个会话（Map 保留插入序）。
-        while (reflectQueuedTurn.size > MAX_REFLECT_TRACKED) {
-          const oldest = reflectQueuedTurn.keys().next().value
-          if (oldest === undefined) break
-          reflectQueuedTurn.delete(oldest)
-        }
+    const text = message.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text).join('\n')
+    if (turn !== undefined) {
+      reflectQueuedTurn.set(sidTs, turn)
+      while (reflectQueuedTurn.size > MAX_REFLECT_TRACKED) {
+        const oldest = reflectQueuedTurn.keys().next().value
+        if (oldest === undefined) break
+        reflectQueuedTurn.delete(oldest)
       }
-      ctx.logger.info(`meow-memory: reflect sent as standalone turn after ${resolved.reflectTurns}+ tool turns`)
-    } else {
-      ctx.logger.warn('meow-memory: reflect 发送失败（本轮不反思，下轮重试）')
     }
+    void runMemoryChild(ctx, agent, text, 'meow-memory reflect', currentMemorySpec()).then((ok) => {
+      if (!ok) ctx.logger.warn('meow-memory: reflect 子代理失败（未影响主轮；本轮不记为成功）')
+    })
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)
   }
 
-  // 2.5) 整理任务换模型：pre-step 在首请求前记录任务身份与模型快照；
-  // 请求钩子始终注册，空配置→非空配置无需重载。旧会话只有日志标记时保留兼容。
-  ctx.on('agent/request', async (payload: { agent?: { session?: { header?: SessionHeaderLike } }; turn?: number; step?: number }, next: () => Promise<unknown>) => {
-    const config = await next() as { provider?: string; model?: string }
-    const agent = payload?.agent
-    if (agent === undefined || agent.session?.header?.origin === 'subagent') return config
-    const sid = sessionIdOfAgent(agent)
-    const events = sessionEventsOf(agent.session as never)
-    const restore = originalRoutes.get(sid) ?? previousConversationRoute(events)
-    const route = memoryRoutes.get(sid)
-    const active = route?.turn === payload.turn
-    if (route !== undefined && !active) memoryRoutes.delete(sid)
-    // DSH 的 next() 继承上一次 request/header；透传不等于恢复主路由。
-    const base = restore === undefined ? config : { ...config, provider: restore.provider, model: restore.model }
-    if (active && route?.paused) return base
-    const spec = active ? route?.spec : isMemoryTaskTurn(sessionEventsOf(agent.session as never)) ? currentMemorySpec() : undefined
-    if (spec === undefined) {
-      if (!active) originalRoutes.delete(sid)
-      return base
-    }
-    if (restore === undefined && typeof config.provider === 'string' && typeof config.model === 'string') {
-      originalRoutes.set(sid, { provider: config.provider, model: config.model })
-    }
-    ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
-    return {
-      ...base,
-      ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
-      ...(spec.model !== undefined ? { model: spec.model } : {}),
-    }
-  })
-
+  // 整理任务只在 fork 子代理上指定 agentOptions；主请求不安装 model waterfall。
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
-  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState, workspaceDisabled)
+  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState, workspaceDisabled, currentMemorySpec)
   ctx.logger.info(
     `meow-memory: dream scheduled (idle ${resolved.dream.idleMinutes}m, suppress ${resolved.dream.suppressWindows.map((w) => `${w.start}-${w.end}`).join(' ')} lead ${resolved.dream.suppressLeadMinutes}m, every ${resolved.dream.checkMinutes}m, tz ${resolved.dream.timeZone}, rules review ${resolved.dream.rulesReviewDays}d)`,
   )
@@ -1712,8 +1675,26 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 修复：立即尝试；未就绪则每 1s 重试（最多 20 次）；dispose 时清理定时器。
   // 注册挂 ctx.effect：fiber dispose 时自动注销（super-injector 热重载契约——裸注册在
   // 热重载时残留路由 → 下次 apply duplicate 报错）。
-  const routeDisposers: Array<() => void> = []
+  const routeDisposers: Array<() => void | Promise<void>> = []
   let routeTimer = 0
+  let taskRouteTimer = 0
+  // Metadata only: the connection's exact Fetch route admits owners before
+  // dispatch; child transcripts remain exclusively on the official client face.
+  const tryRegisterTaskRoute = (attempt: number): void => {
+    const connection = (ctx as { get?: (name: string) => unknown }).get?.('connection') as
+      | Parameters<typeof registerTaskMetadataRoute>[0]
+      | undefined
+    if (typeof connection?.fetch?.register === 'function') {
+      try {
+        routeDisposers.push(registerTaskMetadataRoute(connection, taskJournal))
+      } catch (error) { ctx.logger.warn(`meow-memory: task metadata route unavailable: ${String(error)}`) }
+    } else if (attempt < 20) {
+      taskRouteTimer = setTimeout(() => tryRegisterTaskRoute(attempt + 1), 1000) as unknown as number
+    } else {
+      ctx.logger.warn('meow-memory: authenticated task metadata route unavailable')
+    }
+  }
+  tryRegisterTaskRoute(0)
   const tryRegisterDreamRoutes = (attempt: number): void => {
     const ws = (ctx as { get?: (name: string) => unknown }).get?.('webServer') as
       | { register?: (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }) => () => void }
@@ -1834,7 +1815,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (commands !== undefined && typeof commands.register === 'function') {
       const registerCommand = commands.register
       try {
-        commandDisposers.push(ctx.effect(() => registerCommand.call(commands, dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))))
+        commandDisposers.push(ctx.effect(() => registerCommand.call(commands, dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled, currentMemorySpec))))
         ctx.logger.info('meow-memory: /dream user command registered')
       } catch (e) {
         ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
@@ -1863,13 +1844,18 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         try { dispose() } catch { /* cleanup continues */ }
       }
       for (const dispose of routeDisposers) {
-        try { dispose() } catch { /* cleanup continues */ }
+        try { await dispose() } catch { /* cleanup continues */ }
       }
       for (const dispose of commandDisposers) {
         try { dispose() } catch { /* cleanup continues */ }
       }
       clearTimeout(routeTimer)
+      clearTimeout(taskRouteTimer)
       clearTimeout(commandTimer)
+      stopDream()
+      await disposeMemoryChildren(ctx)
+      taskJournal.close()
+      setMemoryTaskJournal(undefined, ctx)
       await sessionMigration.dispose()
     } finally {
       stopDream()
@@ -2019,6 +2005,8 @@ export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectio
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
+export { TaskJournal } from './task-journal.js'
+export { setMemoryTaskJournal } from './dream.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, dreamTool, runMemoryChild, isOwnedMemoryChild, noteMemoryChildToolError, disposeMemoryChildren, type DreamConfig } from './dream.js'

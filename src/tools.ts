@@ -30,7 +30,7 @@ export type { Level }
 // 通道（throw new Error）走，模型可直接读到原因。
 export interface MemoryToolGate {
   refuseRead?: (workspace: string, sessionId: string | null) => string | null
-  refuseWrite?: (workspace: string, sessionId: string | null) => string | null
+  refuseWrite?: (workspace: string, sessionId: string | null, childId: string | null) => string | null
 }
 
 let toolGate: MemoryToolGate | undefined
@@ -45,7 +45,7 @@ function refuseOrThrow(kind: 'read' | 'write', exec: ToolRunContext): void {
   const workspace = workspaceOf(exec)
   if (workspace === undefined) return
   const sessionId = sessionIdOf(exec)
-  const refusal = kind === 'read' ? toolGate.refuseRead?.(workspace, sessionId) : toolGate.refuseWrite?.(workspace, sessionId)
+  const refusal = kind === 'read' ? toolGate.refuseRead?.(workspace, sessionId) : toolGate.refuseWrite?.(workspace, sessionId, typeof exec.agent?.session?.header?.id === 'string' ? exec.agent.session.header.id : null)
   if (refusal !== null && refusal !== undefined) throw new Error(refusal)
 }
 

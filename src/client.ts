@@ -29,6 +29,8 @@ import {
   type VanishDecision,
 } from './client-delegate-vanish.ts'
 import { applyDelegateNotices, computeDelegateNotices, startDelegateStateSync, type DelegateNotice } from './client-delegate-notice.ts'
+import { applyTaskCards, readTaskProcess, openTaskCard, TASK_CARD_CSS } from './client-task-card.ts'
+import type { MemoryTask } from './task-journal.js'
 import { startDreamIconManager } from './client-dream-icon.ts'
 import { startDreamSkipManager } from './client-dream-skip.ts'
 import { startMenuDreamFace } from './client-menu-dream.ts'
@@ -43,7 +45,8 @@ const INJ_ANCHOR_ATTR = 'data-meow-injection-anchor'
 const INJ_BODY_ATTR = 'data-meow-injection-body'
 const INJ_PROMPT_ATTR = 'data-meow-injection-prompt'
 
-const FOLD_CSS = `[${FOLDED_ATTR}="true"] { display: none !important; }
+const FOLD_CSS = `${TASK_CARD_CSS}
+[${FOLDED_ATTR}="true"] { display: none !important; }
 [data-meow-detail-body] {
   display: none;
   margin: 2px 0 8px 22px;
@@ -520,10 +523,12 @@ function applyTurnNavHiding(memoryTurns: ReadonlySet<number>): void {
 const chatIdentity = (chat: unknown): unknown => chat
 
 export function MemoryFoldDock(props: {
+  sessions?: any
   /** 旧宿主（0.1.2-）：含 .chat 的会话快照；新宿主上缺席或为纯生命周期快照。 */
   session?: unknown
   /** 新宿主（0.1.3+）：响应式 chat 快照 hook（useChat(selector) → ChatSnapshot）。 */
   useChat?: (selector: (chat: unknown) => unknown) => unknown
+  sessionId?: string
 }): null {
   const useChat = props?.useChat
   // hooks 顺序按宿主形态固定（同一宿主内 useChat 要么恒在要么恒缺），不违反规则。
@@ -536,6 +541,33 @@ export function MemoryFoldDock(props: {
         : undefined)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const [injExpanded, setInjExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  const [tasks, setTasks] = useState<MemoryTask[]>([])
+  const parentId = props.sessionId ?? (props.session as { sessionId?: string; id?: string; header?: { id?: string } } | undefined)?.sessionId
+    ?? (props.session as { id?: string; header?: { id?: string } } | undefined)?.id
+    ?? (props.session as { header?: { id?: string } } | undefined)?.header?.id
+  useEffect(() => {
+    if (!parentId) { setTasks([]); return }
+    let active = true
+    const refresh = async (): Promise<void> => {
+      try {
+        const res = await fetch(`/api/meow-memory/tasks?parentId=${encodeURIComponent(parentId)}`, { cache: 'no-store' })
+        if (res.ok) {
+          const data = await res.json() as { tasks?: MemoryTask[] }
+          if (active && Array.isArray(data.tasks)) setTasks(data.tasks)
+        }
+      } catch { /* host route optional */ }
+    }
+    void refresh()
+    const timer = window.setInterval(() => { void refresh() }, 4000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [parentId])
+  const openTask = useCallback((task: MemoryTask, body: HTMLElement): void => {
+    if (!parentId) return
+    openTaskCard(task, body, () => readTaskProcess(task, props.sessions))
+  }, [parentId, props.sessions])
+  const applyTasks = useCallback((): void => {
+    applyTaskCards(tasks.filter(task => task.parentId === parentId), (snapshot as { chat?: Parameters<typeof applyTaskCards>[1] })?.chat, openTask)
+  }, [tasks, snapshot, openTask, parentId])
   const groups = useMemo(() => computeFoldGroups(snapshot as never), [snapshot])
   const injGroups = useMemo(() => computeInjectionGroups(snapshot as never), [snapshot])
   const dgNotices = useMemo(() => computeDelegateNotices(snapshot as never), [snapshot])
@@ -566,12 +598,13 @@ export function MemoryFoldDock(props: {
     applyFoldState(groups, expanded, toggle, snapshot as never)
     applyInjectionFold(injGroups, injExpanded, toggleInj)
     applyDelegateNotices(dgNotices)
+    applyTasks()
     applyTurnNavHiding(memTurns)
-  }, [groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns])
+  }, [groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns, applyTasks])
 
   // 兜底：视图切换/元素重建/流式重渲染导致 DOM 变化时自愈（防抖）。
-  const latest = useRef({ groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns })
-  latest.current = { groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns }
+  const latest = useRef({ groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns, applyTasks })
+  latest.current = { groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns, applyTasks }
   useEffect(() => {
     let timer = 0
     const observer = new MutationObserver(() => {
@@ -580,6 +613,7 @@ export function MemoryFoldDock(props: {
         applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.snapshot as never)
         applyInjectionFold(latest.current.injGroups, latest.current.injExpanded, latest.current.toggleInj)
         applyDelegateNotices(latest.current.dgNotices)
+        latest.current.applyTasks()
         applyTurnNavHiding(latest.current.memTurns)
       }, 80)
     })
@@ -587,6 +621,7 @@ export function MemoryFoldDock(props: {
     return () => {
       window.clearTimeout(timer)
       observer.disconnect()
+      for (const card of document.querySelectorAll('[data-meow-task-card]')) card.remove()
     }
   }, [])
 
@@ -725,7 +760,7 @@ export function apply(ctx: any): () => void {
         id: 'meow-memory',
         order: 90,
       },
-      MemoryFoldDock,
+      (props: Parameters<typeof MemoryFoldDock>[0]) => MemoryFoldDock({ ...props, sessions: ctx?.sessions }),
     )))
     // header 子代理列表隐身（delegate fork 子代理全程不出现在 header）：
     // conversation.session.header.lineage 是 single 槽，官方 SubagentHeaderLineage

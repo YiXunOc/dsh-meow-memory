@@ -536,12 +536,13 @@ export class MemoryDb {
   }
 
   /** dream 收尾：清租约 + 记 last_dream_time（dream 完成时刻）。 */
-  finishDream(sessionId: string, time: number): void {
-    this.db
-      .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL, last_dream_time = ? WHERE session_id = ?`)
-      .run(time, sessionId)
+  finishDream(sessionId: string, owner: string | null, time: number, leaseMs = 30 * 60_000): boolean {
+    const changed = this.db
+      .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL, last_dream_time = ? WHERE session_id = ? AND dream_owner IS ? AND (dream_owner IS NULL OR dream_progress_at > ?)`)
+      .run(time, sessionId, owner, Date.now() - leaseMs).changes === 1
     // dream 收尾（完成/中止/封存）= 本轮尝试周期结束：失败计数清零（issue #36）。
-    this.clearDreamFailure(sessionId)
+    if (changed) this.clearDreamFailure(sessionId)
+    return changed
   }
 
   /** dream 失败释放：只清租约，**不动 last_dream_time**——窗口保持「待整理」状态，
@@ -549,10 +550,28 @@ export class MemoryDb {
    *  与 finishDream 的语义区分：finish=完成/用户中止（封存，last_dream_time=收尾时刻）；
    *  release=执行失败（网络/服务瞬态故障，非用户意愿，2026-09-05 教训：把失败窗口
    *  按 aborted 封存会让一次断网整夜吞掉所有窗口的 dream 且永不重试）。 */
-  releaseDream(sessionId: string): void {
-    this.db
-      .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL WHERE session_id = ?`)
-      .run(sessionId)
+  releaseDream(sessionId: string, owner: string, expiredAt?: number): boolean {
+    const condition = expiredAt === undefined ? 'dream_progress_at > ?' : 'dream_progress_at = ?'
+    return this.db
+      .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL WHERE session_id = ? AND dream_owner = ? AND ${condition}`)
+      .run(sessionId, owner, expiredAt ?? Date.now() - 30 * 60_000).changes === 1
+  }
+
+  /** Release and count a failure in one write transaction, never against a replacement. */
+  releaseDreamFailure(sessionId: string, owner: string, T: number, expiredAt?: number): number | null {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (!this.releaseDream(sessionId, owner, expiredAt)) {
+        this.db.exec('ROLLBACK')
+        return null
+      }
+      const failures = this.recordDreamFailure(sessionId, T)
+      this.db.exec('COMMIT')
+      return failures
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   // ── dream 失败计数（issue #36）──────────────────────────────────────────────
@@ -577,6 +596,13 @@ export class MemoryDb {
       .prepare(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
       .run(`dreamfail_c:${sessionId}`, count)
     return count
+  }
+
+  /** 是否已达到相同整理范围 T 的失败上限；新活动改变 T 后重新允许尝试。 */
+  dreamFailureCapped(sessionId: string, T: number, limit: number): boolean {
+    const at = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_t:${sessionId}`) as { value: number | null } | undefined
+    const count = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_c:${sessionId}`) as { value: number | null } | undefined
+    return at?.value === T && typeof count?.value === 'number' && count.value >= limit
   }
 
   /** 清 dream 失败计数（finishDream 收尾时自动调用；一般无需手动调）。 */
@@ -611,25 +637,25 @@ export class MemoryDb {
   }
 
   /** CAS 推进租约：group_idx +1 并刷新心跳。多实例同收 turn-stopping 时只有一个成功。 */
-  advanceDreamLease(sessionId: string, fromIdx: number, leaseMs: number): boolean {
+  advanceDreamLease(sessionId: string, owner: string, fromIdx: number, leaseMs: number): boolean {
     const now = Date.now()
     return (
       this.db
         .prepare(
           `UPDATE windows SET dream_group_idx = dream_group_idx + 1, dream_progress_at = ?
-           WHERE session_id = ? AND dream_group_idx = ? AND dream_owner IS NOT NULL AND dream_progress_at > ?`,
+           WHERE session_id = ? AND dream_group_idx = ? AND dream_owner = ? AND dream_progress_at > ?`,
         )
-        .run(now, sessionId, fromIdx, now - leaseMs).changes === 1
+        .run(now, sessionId, fromIdx, owner, now - leaseMs).changes === 1
     )
   }
 
   /** 轮内租约心跳：只刷新 progress_at，不动 group_idx（推进仍归 advanceDreamLease 的 CAS）。
    *  安全性：只 touch 梦的活跃租约——finalize/release/abort 清租约后 changes=0，
    *  调用方据此自动停表，僵尸 dream 永远不会被心跳续命。 */
-  touchDreamLease(sessionId: string): boolean {
+  touchDreamLease(sessionId: string, owner: string, leaseMs = 30 * 60_000): boolean {
     return this.db
-      .prepare(`UPDATE windows SET dream_progress_at = ? WHERE session_id = ? AND dream_owner IS NOT NULL`)
-      .run(Date.now(), sessionId).changes === 1
+      .prepare(`UPDATE windows SET dream_progress_at = ? WHERE session_id = ? AND dream_owner = ? AND dream_progress_at > ?`)
+      .run(Date.now(), sessionId, owner, Date.now() - leaseMs).changes === 1
   }
 
   // ── dream_skip 门控表（v0.16.0 跳过 dream → v0.30.0 升级为「记忆参与」三档门控，#38）──
@@ -735,6 +761,25 @@ export class MemoryDb {
       n += this.db.prepare(`UPDATE ${level} SET updated_at = MAX(updated_at, ?) WHERE id = ?`).run(time, id).changes
     }
     return n
+  }
+
+  /** Stamp only the current live owner, atomically with lease completion. */
+  finalizeOwnedDream(sessionId: string, owner: string, T: number, leaseMs: number): number | null {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const lease = this.getDreamLease(sessionId)
+      if (lease?.owner !== owner || lease.T !== T || Date.now() - lease.progress_at >= leaseMs) {
+        this.db.exec('ROLLBACK')
+        return null
+      }
+      const stamped = this.stampDream(sessionId, T)
+      if (!this.finishDream(sessionId, owner, Date.now(), leaseMs)) throw new Error('dream owner changed during finalization')
+      this.db.exec('COMMIT')
+      return stamped
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   private fromRow(level: Level, r: Record<string, unknown>): MemoryRow {

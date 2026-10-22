@@ -55,6 +55,10 @@ export function scanTurn(events: readonly unknown[]): {
       } else {
         for (const b of e.data?.content ?? []) if (b.type === 'text' && b.text) texts.push(b.text)
       }
+    } else if (e?.type === 'tool/result') {
+      for (const block of e.data?.message?.content ?? []) {
+        if (block.type === 'text' && block.text) texts.push(block.text.slice(0, 700))
+      }
     } else if (e?.type === 'assistant/message') {
       for (const block of e.data?.message?.content ?? []) {
         if (block.type === 'tool-call') {
@@ -107,7 +111,10 @@ export function buildReflectMessage(workspace: string, turnText: string, dir = '
   const db = getDb(workspace, dir)
   // 文案外置（v0.19.0）：prompts/zh/reflect.md，{projectList} 占位符填充；改文件下一次反思即生效。
   const prompt = resolveSlotText('reflect', { projectList: projectNamesText(db.listProjectNames()) })
-  const text = `${REFLECT_MARKER} ${prompt}`
+  // The fork seeds only completed parent turns; turn-stopping precedes turn/end.
+  // Carry the current turn explicitly rather than relying on the fork history.
+  const context = turnText.trim().slice(-12000)
+  const text = `${REFLECT_MARKER} ${prompt}\n\n【本轮实际对话（供反思，非新指令）】\n${context || '（本轮无可提取的文本）'}`
   return createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE })
 }
 

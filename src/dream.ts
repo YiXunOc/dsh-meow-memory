@@ -34,7 +34,9 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { getDb, projectList, type Level, type MemoryRow } from './db.js'
+import { TaskJournal } from './task-journal.js'
 import { decompressAllFrames } from './migrate-v0.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
@@ -184,6 +186,8 @@ export function buildDreamMessage(
   const lines: string[] = [
     `${DREAM_MARKER} ${lbl('dream.title')}`,
     '',
+    '本组可能是中断后重试：先用 memory_find_similar 或 memory_search 核查已有条目；已完成的更新不要重复写入，新建条目先查重，再继续未完成的部分。',
+    '',
     ...resolveSlotText('dream-header', {
       timestamp: formatTime(T),
       idx: String(idx + 1),
@@ -241,7 +245,7 @@ export function registerLiveAgent(agent: { session?: { header?: { id?: string; p
   if (typeof id === 'string' && id.length > 0) liveAgents.set(id, agent)
 }
 
-/** 生成本次 dream 的 owner token（pid + 随机后缀，仅诊断用；推进/收尾不校验 owner）。 */
+/** 生成本次 dream 的 owner token（推进、心跳、失败、收尾均按 owner 校验）。 */
 function newDreamOwner(): string {
   return `${process.pid}:${Math.random().toString(36).slice(2, 10)}`
 }
@@ -328,6 +332,106 @@ export function sendMemoryTurn(agent: unknown, msg: unknown, workspace: string, 
   }
 }
 
+export function noteMemoryChildToolError(childId: string): void {
+  memoryChildToolErrors.add(childId)
+  if (memoryChildToolErrors.size > 512) memoryChildToolErrors.delete(memoryChildToolErrors.values().next().value!)
+}
+const memoryChildToolErrors = new Set<string>()
+const ownedMemoryChildren = new Set<string>()
+const memoryTaskJournals = new WeakMap<Context, TaskJournal>()
+export function setMemoryTaskJournal(journal?: TaskJournal, ctx?: Context): void {
+  if (ctx) {
+    if (journal) memoryTaskJournals.set(ctx, journal)
+    else memoryTaskJournals.delete(ctx)
+  }
+}
+
+function parentAnchor(parent: unknown): { parentId: string; turn?: number; anchorSeq?: number } | undefined {
+  const session = (parent as { session?: { header?: { id?: string }; ownEvents?: () => readonly unknown[]; events?: readonly unknown[] } })?.session
+  const parentId = session?.header?.id
+  if (!parentId) return undefined
+  const events = typeof session.ownEvents === 'function' ? session.ownEvents() : session.events ?? []
+  const start = [...events].reverse().find(e => (e as { type?: string }).type === 'turn/start') as { data?: { turn?: number }; seq?: number } | undefined
+  const last = events[events.length - 1] as { seq?: number } | undefined
+  return { parentId, turn: start?.data?.turn, anchorSeq: last?.seq }
+}
+
+export function isOwnedMemoryChild(id: string): boolean { return ownedMemoryChildren.has(id) }
+const childTasks = new Map<Context, Set<{ abort: AbortController; task: Promise<boolean>; stop: () => Promise<void> }>>()
+const dreamTasks = new Map<Context, Set<Promise<void>>>()
+const disposedChildContexts = new WeakSet<Context>()
+
+/** Stop this plugin fiber's children, including activations still publishing. */
+export async function disposeMemoryChildren(ctx?: Context): Promise<void> {
+  if (ctx) disposedChildContexts.add(ctx)
+  const groups = ctx ? [childTasks.get(ctx)] : [...childTasks.values()]
+  const tasks = groups.flatMap((group) => [...(group ?? [])])
+  for (const task of tasks) task.abort.abort()
+  await Promise.all(tasks.map(async (task) => { await task.stop(); await task.task }))
+  const dreams = ctx ? [dreamTasks.get(ctx)] : [...dreamTasks.values()]
+  await Promise.all(dreams.flatMap((group) => [...(group ?? [])]))
+}
+
+/** Start a caller-delivered fork. Neither failures nor completion enter the parent's inbox. */
+export async function runMemoryChild(ctx: Context, parent: unknown, text: string, label: string, agentOptions?: { provider?: string; model?: string }, taskId?: string): Promise<boolean> {
+  const service = (ctx as { get?: (name: string) => unknown }).get?.('subagents') as
+    | { startActivation?: (spec: unknown) => Promise<{ childId: string; result: Promise<{ stopReason: string }>; dispose: () => Promise<void> }> }
+    | undefined
+  // Child work must not use the parent inbox; caller delivery suppresses settlement notices.
+  if (typeof service?.startActivation !== 'function') return false
+  if (disposedChildContexts.has(ctx)) return false
+  const childId = `meow-memory-${randomUUID()}`
+  const anchor = parentAnchor(parent)
+  const journal = memoryTaskJournals.get(ctx)
+  let recordedTask: string | undefined
+  if (anchor && journal) {
+    try {
+      recordedTask = journal.start({ ...anchor, kind: label.includes('dream') ? 'dream' : 'reflect', childId, taskId }).id
+    } catch (error) { console.warn(`[meow-memory] task journal start failed: ${String(error)}`) }
+  }
+  const abort = new AbortController()
+  let run: { childId: string; result: Promise<{ stopReason: string }>; dispose: () => Promise<void> } | undefined
+  let disposing: Promise<void> | undefined
+  const stop = (): Promise<void> => {
+    abort.abort()
+    if (!run) return Promise.resolve()
+    return disposing ??= run.dispose().catch((error) => { console.warn(`[meow-memory] ${label} child cleanup failed: ${String(error)}`) })
+  }
+  ownedMemoryChildren.add(childId) // event handlers and skip_write gate must see the child before publication
+  const task = (async (): Promise<boolean> => {
+    try {
+      run = await service.startActivation({ provider: 'fork', delivery: 'caller', label, childId, request: { parent, prompt: [{ type: 'text', text }], ...(agentOptions ? { agentOptions } : {}) }, signal: abort.signal })
+      if (run.childId !== childId) throw new Error('subagent returned a different reserved child id')
+      if (abort.signal.aborted) return false
+      const result = await Promise.race([
+        run.result,
+        new Promise<{ stopReason: string }>((resolve) => abort.signal.addEventListener('abort', () => resolve({ stopReason: 'aborted' }), { once: true })),
+      ])
+      return !abort.signal.aborted && result.stopReason === 'completed' && !memoryChildToolErrors.has(childId)
+    } catch (error) {
+      console.warn(`[meow-memory] ${label} child failed: ${String(error)}`)
+      return false
+    } finally {
+      await stop()
+      memoryChildToolErrors.delete(childId)
+      ownedMemoryChildren.delete(childId)
+    }
+  })()
+  const group = childTasks.get(ctx) ?? new Set()
+  childTasks.set(ctx, group)
+  const entry = { abort, task, stop }
+  group.add(entry)
+  try {
+    const ok = await task
+    const reviewed = !recordedTask || journal?.get(recordedTask)?.reviewedChild === childId
+    if (recordedTask && (!taskId || !ok || !reviewed)) journal?.finish(recordedTask, ok && reviewed)
+    return ok && reviewed
+  } finally {
+    group.delete(entry)
+    if (group.size === 0) childTasks.delete(ctx)
+  }
+}
+
 // ── dream 租约轮内心跳（2026-09-10）────────────────────────────────────────
 // 心跳原本只在轮边界刷（advanceDreamLease 的 CAS 推进），LEASE=30min 必须 > 单组
 // 最长处理时间；单组一旦超 30min（LLM 停顿/重试），扫描线程按过期租约判死收尾 →
@@ -338,23 +442,24 @@ export function sendMemoryTurn(agent: unknown, msg: unknown, workspace: string, 
 // 死亡判定语义完全不变。HEARTBEAT_MAX_MS 封顶：极端挂死的组最多续 6h，之后放过期。
 const DREAM_HEARTBEAT_MS = 60_000
 const HEARTBEAT_MAX_MS = 6 * 3600_000
-const dreamHeartbeats = new Map<string, { timer: ReturnType<typeof setInterval>; startedAt: number }>()
+const dreamHeartbeats = new Map<string, { timer: ReturnType<typeof setInterval>; startedAt: number; owner: string }>()
 
-function armDreamHeartbeat(sessionId: string, workspace: string, dir: string): void {
-  if (dreamHeartbeats.has(sessionId)) return // 一次 dream 只挂一个心跳（advanceDream 重入幂等）
+function armDreamHeartbeat(sessionId: string, owner: string, workspace: string, dir: string): void {
+  if (dreamHeartbeats.get(sessionId)?.owner === owner) return
+  stopDreamHeartbeat(sessionId)
   const startedAt = Date.now()
   const timer = setInterval(() => {
     const hb = dreamHeartbeats.get(sessionId)
     if (hb === undefined) return
     try {
-      if (Date.now() - hb.startedAt > HEARTBEAT_MAX_MS || !getDb(workspace, dir).touchDreamLease(sessionId)) {
+      if (Date.now() - hb.startedAt > HEARTBEAT_MAX_MS || !getDb(workspace, dir).touchDreamLease(sessionId, hb.owner, DREAM_LEASE_MS)) {
         stopDreamHeartbeat(sessionId) // 到封顶 或 租约已不在（收尾/释放/被别实例接管）→ 停表
       }
     } catch {
       stopDreamHeartbeat(sessionId) // 库已关（热重载 dispose）/瞬时锁错误：心跳退役，绝不带崩宿主
     }
   }, DREAM_HEARTBEAT_MS)
-  dreamHeartbeats.set(sessionId, { timer, startedAt })
+  dreamHeartbeats.set(sessionId, { timer, startedAt, owner })
 }
 
 function stopDreamHeartbeat(sessionId: string): void {
@@ -369,14 +474,15 @@ export function disposeDreamHeartbeats(): void {
   for (const sid of [...dreamHeartbeats.keys()]) stopDreamHeartbeat(sid)
 }
 
-export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): boolean {
+export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS, modelSpec?: { provider?: string; model?: string }, manual = false): boolean {
   const sessionId = agent.session?.header?.id
   if (!sessionId) return false
   const db = getDb(workspace, dir)
+  if (typeof (ctx as { get?: (name: string) => { startActivation?: unknown } | undefined }).get?.('subagents')?.startActivation !== 'function') return false
   const rounds = collectDreamRounds(db, sessionId, workspace, dir, rulesReviewDays)
   if (rounds.length === 0) {
     // 无本窗口记忆（建立的 ∪ 提取过的都无）：也推进 last_dream_time（= 本窗口无可整理），避免 need=true 恒成立、每轮空扫到 24h
-    db.finishDream(sessionId, Date.now())
+    db.finishDream(sessionId, null, Date.now())
     dreamLog(workspace, dir, `dream skip-empty sid=${shortSessionId(sessionId)}`)
     onDreamState?.(sessionId, 'dreamed')
     return false
@@ -384,23 +490,69 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   const win = db.getWindow(sessionId)
   // claimDream 的 INSERT OR IGNORE 会给新窗口行造出 last_event_time=0 哨兵，这里兜底 0
   const T = win && win.last_event_time > 0 ? win.last_event_time : Date.now()
-  if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
+  if (!manual && db.dreamFailureCapped(sessionId, T, DREAM_MAX_ATTEMPTS)) return false
+  const owner = newDreamOwner()
+  if (!db.claimDream(sessionId, owner, T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
   onDreamState?.(sessionId, 'dreaming')
-  const msg = buildDreamMessage(db, sessionId, T, rounds, 0)
-  if (!sendMemoryTurn(agent, msg, workspace, dir, `dream start sid=${shortSessionId(sessionId)}`)) {
-    // 没送达：释放租约让下个周期自然重试，不把窗口卡在"进行中"。
-    db.releaseDream(sessionId)
-    return false
-  }
-  armDreamHeartbeat(sessionId, workspace, dir) // 轮内心跳：单组 >30min 不再被判死收尾
-  dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
+  armDreamHeartbeat(sessionId, owner, workspace, dir)
+  const dreamTaskId = randomUUID()
+  const journal = memoryTaskJournals.get(ctx)
+  const dreamTask = (async () => {
+    try {
+      if (db.getDreamLease(sessionId)?.owner !== owner) return
+      const completed = new Set<DreamRound['kind']>()
+      const reviewedAtomic = new Set<string>()
+      // Three semantic kinds plus one catch-up pass; churn beyond this retries without stamping.
+      const maxRounds = 4
+      for (let idx = 0; ; idx++) {
+        const current = db.getDreamLease(sessionId)
+        if (current?.owner !== owner || current.T !== T || Date.now() - current.progress_at >= DREAM_LEASE_MS) return
+        const latest = collectDreamRounds(db, sessionId, workspace, dir, rulesReviewDays)
+        const atomicIdx = latest.findIndex((round) => round.kind === 'atomic')
+        const newAtomic = atomicIdx >= 0 && latest[atomicIdx].groups.some((group) => group.rows.some((row) => !reviewedAtomic.has(row.id)))
+        const roundIdx = newAtomic ? atomicIdx : latest.findIndex((round) => !completed.has(round.kind))
+        if (roundIdx < 0) {
+          finalizeDream(db, sessionId, owner, workspace, dir, T, 'done', idx, onDreamState)
+          journal?.finish(dreamTaskId, true)
+          return
+        }
+        if (idx >= maxRounds) {
+          journal?.finish(dreamTaskId, false)
+          if (handleMemoryTurnFailure(db, sessionId, workspace, dir, owner) !== 'none') onDreamState?.(sessionId, 'active')
+          return
+        }
+        if (idx > 0 && !db.advanceDreamLease(sessionId, owner, idx - 1, DREAM_LEASE_MS)) return
+        const msg = buildDreamMessage(db, sessionId, T, latest, roundIdx)
+        const text = msg.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text).join('\n')
+        if (!await runMemoryChild(ctx, agent, text, `meow-memory dream ${roundIdx + 1}/${latest.length}`, modelSpec, dreamTaskId)) {
+          try { if (handleMemoryTurnFailure(db, sessionId, workspace, dir, owner) !== 'none') onDreamState?.(sessionId, 'active') } catch { /* database closed during reload */ }
+          return
+        }
+        completed.add(latest[roundIdx].kind)
+        if (latest[roundIdx].kind === 'atomic') {
+          for (const group of latest[roundIdx].groups) for (const row of group.rows) reviewedAtomic.add(row.id)
+        }
+      }
+    } catch (error) {
+      journal?.finish(dreamTaskId, false)
+      dreamLog(workspace, dir, `dream child failed sid=${shortSessionId(sessionId)} err=${String(error)}`)
+      try { if (handleMemoryTurnFailure(db, sessionId, workspace, dir, owner) !== 'none') onDreamState?.(sessionId, 'active') } catch { /* database closed during reload */ }
+    }
+  })()
+  const group = dreamTasks.get(ctx) ?? new Set<Promise<void>>()
+  dreamTasks.set(ctx, group)
+  group.add(dreamTask)
+  void dreamTask.finally(() => {
+    group.delete(dreamTask)
+    if (group.size === 0) dreamTasks.delete(ctx)
+  })
   return true
 }
 
 /**
  * 推进：本窗口有进行中 dream → 下一组或收尾。
  * 状态完全从 DB 租约读：跨实例、热重载残留、中止都不影响推进正确性。
- * 推进按「sessionId + 租约未过期」判定，不校验 owner（owner 只用于抢占判断 + 诊断）。
+ * 推进按「sessionId + owner + 租约未过期」判定。
  * 执行体：steer 主会话（由 turn-stopping 驱动进入，组消息落主 log）。
  * 后续组用 steer（next-step）连在 dream 自己的 turn 里（2026-09-10 用户拍板：
  * 多组不分轮——只有第 0 组经 sendMemoryTurn 另起 turn，整个 dream 任务一个
@@ -415,13 +567,11 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
   if (lease === null) return // 无进行中 dream（已收尾/未开始）：不动
 
   if (Date.now() - lease.progress_at > DREAM_LEASE_MS) {
-    // 租约过期 = 主人已死：补收尾（不再推进），防止窗口永久 need=true 反复 start
+    // 租约过期只释放待重试，不把尚未完成的组盖章。
     recoverInterruptedDream(db, sessionId, ws, dir)
     dreamLog(ws, dir, `advanceDream expired-recover sid=${shortSessionId(sessionId)}`)
-    // 零进展释放（issue #36）≠ 整理完成：去月亮（active）而非加月亮（dreamed）；
-    // 封存路径 last_dream_time 已置上，照旧 dreamed。
-    const wAfter = db.getWindow(sessionId)
-    onDreamState?.(sessionId, wAfter !== undefined && wAfter.last_dream_time !== null ? 'dreamed' : 'active')
+    // 释放路径广播 active；若并发新 owner 已抢占，不覆盖其 dreaming 状态。
+    if (db.getDreamLease(sessionId) === null) onDreamState?.(sessionId, 'active')
     return
   }
 
@@ -429,8 +579,8 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
   const nextIdx = lease.group_idx + 1
   if (nextIdx < rounds.length) {
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
-    if (db.advanceDreamLease(sessionId, lease.group_idx, DREAM_LEASE_MS)) {
-      armDreamHeartbeat(sessionId, ws, dir) // 热重载后新模块实例没有旧心跳：推进时补挂（幂等）
+    if (db.advanceDreamLease(sessionId, lease.owner, lease.group_idx, DREAM_LEASE_MS)) {
+      armDreamHeartbeat(sessionId, lease.owner, ws, dir) // 热重载后新模块实例没有旧心跳：推进时补挂（幂等）
       const msg = buildDreamMessage(db, sessionId, lease.T, rounds, nextIdx)
       const tag = `dream group ${nextIdx + 1}/${rounds.length}`
       // 后续组用 steer（非 followup）：连在 dream 自己的 turn 里，多组不分轮
@@ -439,15 +589,15 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     return
   }
   // 最后一轮完成 → 收尾
-  finalizeDream(db, sessionId, ws, dir, lease.T, 'done', rounds.length, onDreamState)
+  finalizeDream(db, sessionId, lease.owner, ws, dir, lease.T, 'done', rounds.length, onDreamState)
 }
 
 /** 收尾：封存全部条目（updated_at=T）+ 清租约 + 记 last_dream_time。失败不阻塞（日志兜底）。 */
-function finalizeDream(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir: string, T: number, reason: 'done' | 'aborted', groupsCount: number, onDreamState?: DreamStateCallback): void {
-  stopDreamHeartbeat(sessionId) // 租约即清，心跳立刻退役（不等下一个 60s tick 自愈）
+function finalizeDream(db: ReturnType<typeof getDb>, sessionId: string, owner: string, workspace: string, dir: string, T: number, reason: 'done' | 'aborted', groupsCount: number, onDreamState?: DreamStateCallback): void {
   try {
-    const stamped = db.stampDream(sessionId, T)
-    db.finishDream(sessionId, Date.now())
+    const stamped = db.finalizeOwnedDream(sessionId, owner, T, DREAM_LEASE_MS)
+    if (stamped === null) return
+    if (dreamHeartbeats.get(sessionId)?.owner === owner) stopDreamHeartbeat(sessionId)
     db.logDream(
       `window dream ${reason}: ${shortSessionId(sessionId)} groups=${groupsCount} stamped=${stamped} T=${new Date(T).toISOString()}`,
       { before: undefined, after: undefined },
@@ -468,12 +618,12 @@ export function abortDream(agent: unknown, dir = '.dsh-meow', onDreamState?: Dre
   const db = getDb(ws, dir)
   const lease = db.getDreamLease(sessionId)
   if (lease === null) return // 没有进行中 dream
-  finalizeDream(db, sessionId, ws, dir, lease.T, 'aborted', lease.group_idx + 1, onDreamState)
+  finalizeDream(db, sessionId, lease.owner, ws, dir, lease.T, 'aborted', lease.group_idx + 1, onDreamState)
 }
 
 // ── 工具：memory_dream（手动触发本窗口 dream） ─────────────────────────────
 
-export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean): ToolDefinition {
+export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean, modelSpec?: () => { provider?: string; model?: string } | undefined): ToolDefinition {
   return {
     name: 'memory_dream',
     description: keyedValue('tools', 'memory_dream.description'),
@@ -513,7 +663,7 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
       // 工作区停用（#28 硬开关）：手动触发也不放行（写了也进不去，白烧 token）。
       if (workspaceDisabled?.(workspace) === true) return { ok: false, note: '该工作区已停用记忆（disabledWorkspaces 名单）：dream 不可用。' }
       const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
-      const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rrd)
+      const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rrd, modelSpec?.(), true)
       if (ok) return { ok, note: '整理任务已在后台启动，会话流中的任务气泡会显示进度与完成状态。' }
       const sessionId = exec.agent.session?.header?.id
       const lease = typeof sessionId === 'string' ? getDb(workspace, dir).getDreamLease(sessionId) : null
@@ -554,7 +704,7 @@ export interface DreamCommandDefinition {
  * command-error 明确提示未启动原因，不会把 /dream 发给模型）。
  * 注册由 index.ts 负责（ctx.get('commands') 可选服务 + 就绪重试 + ctx.effect 清理）。
  */
-export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean): DreamCommandDefinition {
+export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean, modelSpec?: () => { provider?: string; model?: string } | undefined): DreamCommandDefinition {
   return {
     name: 'dream',
     description: '手动唤起一次记忆整理（dream）：逐轮回顾本窗口建立/提取过的跨会话记忆并封存。与 memory_dream 工具相同，手动触发不受峰时抑制。',
@@ -577,7 +727,7 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
         return { kind: 'error', text: '该工作区已停用记忆（disabledWorkspaces 名单）：/dream 不可用。' }
       }
       const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
-      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rrd)
+      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rrd, modelSpec?.(), true)
       if (ok) return { kind: 'success', text: '🧠 dream 已触发：整理任务已在后台运行，会话流中的任务气泡会显示进度与完成状态。' }
       const lease = getDb(workspace, dir).getDreamLease(header.id)
       return lease !== null
@@ -587,38 +737,24 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
   }
 }
 
-/** 补收尾被打断的 dream（start 过但没 done：进程重启/热重载/跨进程打断）。
- *  有进展（group_idx>0，前序组成果已落库）：照旧视为已完成——封存该窗口条目 +
- *  清 pending + 记 last_dream_time——不再重复 start。
- *  零进展（group_idx=0，一组都没推进——#36 的装配失败轮即此）：封存会让整窗记忆
- *  静默消失且永不重试。改为记失败计数后释放（下个检查周期自动重试；重试对新写入
- *  条目幂等——dedup 合并兜底）；连续失败达 DREAM_MAX_ATTEMPTS 才封存止损（warn
- *  留痕，不再无声）。
- *  @returns 封存（stamped）的条目数（释放路径返回 0；调用方如需区分「封存」与
- *  「释放」，看 windows.last_dream_time 是否被置上）。 */
+/** 过期 dream 无论进度均释放，不盖完成章；未完成组下次从头重试。
+ *  owner+原 progress_at CAS 保护新租约；同 T 连续失败到上限暂停自动重试。
+ *  @returns 0（不再封存未完成的整理）。 */
 export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir = '.dsh-meow'): number {
   const lease = db.getDreamLease(sessionId)
-  const w = db.getWindow(sessionId)
-  const T = lease ? lease.T : w && w.last_event_time > 0 ? w.last_event_time : Date.now()
-  const progressed = lease !== null && lease.group_idx > 0
-  if (!progressed) {
-    const fails = db.recordDreamFailure(sessionId, T)
-    if (fails < DREAM_MAX_ATTEMPTS) {
-      db.releaseDream(sessionId)
+  if (lease === null || Date.now() - lease.progress_at <= DREAM_LEASE_MS) return 0
+  const T = lease.T
+  const fails = db.releaseDreamFailure(sessionId, lease.owner, T, lease.progress_at)
+  if (fails !== null) {
+    if (fails >= DREAM_MAX_ATTEMPTS) {
+      dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails} -> stopped (no stamp)`)
+      console.warn(`[meow-memory] dream 连续失败 ${fails} 次后暂停自动重试（窗口 ${shortSessionId(sessionId)}）；记忆未封存，等待新活动或手动 /dream`)
+    } else {
       dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
-      return 0
     }
-    dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails} -> sealed (cap reached)`)
-    console.warn(`[meow-memory] dream 连续失败 ${fails} 次后中断（窗口 ${shortSessionId(sessionId)}），按封存收尾不再自动重试；该窗口正常对话产生新活动后可重新自动整理，或手动 /dream`)
+    return 0
   }
-  const stamped = db.stampDream(sessionId, T)
-  db.finishDream(sessionId, Date.now())
-  db.logDream(
-    `window dream recovered (interrupted): ${shortSessionId(sessionId)} stamped=${stamped} T=${new Date(T).toISOString()}`,
-    { before: undefined, after: undefined },
-  )
-  dreamLog(workspace, dir, `dream recovered session=${shortSessionId(sessionId)} stamped=${stamped}`)
-  return stamped
+  return 0
 }
 
 /** dream 轮以 turn/end error 收尾的即时处理（issue #36 建议二；session/event 订阅侧调用）。
@@ -628,22 +764,20 @@ export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId:
  *  分支对这类失败是死代码，租约只能等 6h 心跳封顶后被盖章。turn/end 事件在宿主
  *  catch/finally 里必然落盘，是可靠的失败信号。
  *  语义：有租约 = 失败计数 +1 后释放（下个检查周期自动重试）；连续达 DREAM_MAX_ATTEMPTS
- *  封存止损（warn）。无租约（reflect 轮失败等）不动。
- *  @returns 'released'（已释放待重试）/ 'sealed'（达上限封存）/ 'none'（无租约，非 dream）。 */
-export function handleMemoryTurnFailure(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir = '.dsh-meow'): 'released' | 'sealed' | 'none' {
-  stopDreamHeartbeat(sessionId) // 无害：无心跳时空操作；有则立刻退役（release 后 touch 必 changes=0）
+ *  暂停自动重试（warn，不封存）。无租约（reflect 轮失败等）不动。
+ *  @returns 'released'（已释放待重试）/ 'stopped'（达上限暂停）/ 'none'（无租约或 owner 变更）。 */
+export function handleMemoryTurnFailure(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir = '.dsh-meow', owner?: string): 'released' | 'stopped' | 'none' {
   const lease = db.getDreamLease(sessionId)
-  if (lease === null) return 'none'
-  const fails = db.recordDreamFailure(sessionId, lease.T)
+  if (lease === null || (owner !== undefined && lease.owner !== owner)) return 'none'
+  const fails = db.releaseDreamFailure(sessionId, lease.owner, lease.T)
+  if (fails === null) return 'none'
+  if (dreamHeartbeats.get(sessionId)?.owner === lease.owner) stopDreamHeartbeat(sessionId)
   if (fails >= DREAM_MAX_ATTEMPTS) {
-    const stamped = db.stampDream(sessionId, lease.T)
-    db.finishDream(sessionId, Date.now())
-    dreamLog(workspace, dir, `dream turn-failed cap sid=${shortSessionId(sessionId)} fails=${fails} -> sealed (stamped=${stamped})`)
-    console.warn(`[meow-memory] dream 轮连续失败 ${fails} 次（窗口 ${shortSessionId(sessionId)}），已封存不再自动重试；详见 dream-debug.log`)
-    return 'sealed'
+    dreamLog(workspace, dir, `dream child-failed cap sid=${shortSessionId(sessionId)} fails=${fails} -> stopped (no stamp)`)
+    console.warn(`[meow-memory] dream 连续失败 ${fails} 次（窗口 ${shortSessionId(sessionId)}），已暂停自动重试；记忆未封存，详见 dream-debug.log`)
+    return 'stopped'
   }
-  db.releaseDream(sessionId)
-  dreamLog(workspace, dir, `dream turn-failed sid=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
+  dreamLog(workspace, dir, `dream child-failed sid=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
   return 'released'
 }
 
@@ -858,7 +992,7 @@ export function isSubagentAgent(agent: unknown): boolean {
  *  进程重启清零：每窗口最多多 resume 一次，无害。 */
 const autoDreamSkipWindows = new Set<string>()
 
-export async function resumeAndDream(ctx: Context, sessionId: string, workspace: string, dir: string, onDreamState: DreamStateCallback | undefined, cfg: DreamConfig): Promise<void> {
+export async function resumeAndDream(ctx: Context, sessionId: string, workspace: string, dir: string, onDreamState: DreamStateCallback | undefined, cfg: DreamConfig, modelSpec?: () => { provider?: string; model?: string } | undefined): Promise<void> {
   const log = (msg: string): void => dreamLog(workspace, dir, msg)
   const sid = shortSessionId(sessionId)
   if (resumeInFlight.has(sessionId)) return
@@ -910,7 +1044,7 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
     if (!w || !windowNeedsDream(w)) return // 恢复期间超 24h / 已 dream 过
     if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) return // 恢复期间窗口被碰，空闲不足
     if (db.getDreamLease(sessionId) !== null) return // 恢复期间别处已启动 dream
-    startWindowDream(ctx, agent as { session?: { header?: { id?: string } } }, workspace, dir, onDreamState, cfg.rulesReviewDays)
+    startWindowDream(ctx, agent as { session?: { header?: { id?: string } } }, workspace, dir, onDreamState, cfg.rulesReviewDays, modelSpec?.())
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
     // 'session not found' = 会话文件不在本实例 home（跨实例/已删除）：永久性失败，
@@ -925,7 +1059,7 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
 /** dream 自动扫描单轮（scheduleDream 定时驱动；导出供测试直调）。
  *  峰时抑制/全局检查门在 scheduleDream 里，这里只做窗口遍历与启动。
  *  每轮最多 start 一个窗口（start 成功即返回，剩余下周期继续——清积压限速）。 */
-export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean): void {
+export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean, modelSpec?: () => { provider?: string; model?: string } | undefined): void {
   // 已归档会话集合（registry 全局归档；服务不可用时跳过检查）
   const archived = new Set<string>()
   try {
@@ -976,7 +1110,7 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
       // 丢 dream 资格（2026-09-01 用户拍板）。fire-and-forget：不阻塞本轮检查，
       // resumeInFlight 防重入，失败静默降级为旧行为（只跳过不 dream）。
       dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)} -> try resume`)
-      void resumeAndDream(ctx, sessionId, workspace, dir, onDreamState, cfg)
+      void resumeAndDream(ctx, sessionId, workspace, dir, onDreamState, cfg, modelSpec)
       continue
     }
     if (isSubagentAgent(agent)) {
@@ -986,7 +1120,7 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
       dreamLog(workspace, dir, `check skip-subagent sid=${shortSessionId(sessionId)}`)
       continue
     }
-    const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)
+    const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays, modelSpec?.())
     if (started) return // 一轮一个窗口
   }
 }
@@ -997,7 +1131,7 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
  *  定时器里的未捕获异常会终止整个 dsh 进程（插件不得杀宿主，2026-09-10 实测
  *  过一次：0.1.5 的 steer 抛错把进程带崩）。整体兜一层：单次检查失败只记日志，
  *  下个周期照常重试。各窗口/各步骤自身仍各自降级，这里只作最后一道保险。 */
-export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConfig | undefined), dir: string, windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean): void {
+export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConfig | undefined), dir: string, windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean, modelSpec?: () => { provider?: string; model?: string } | undefined): void {
   try {
     const c = typeof cfg === 'function' ? cfg() : cfg
     if (c === undefined || !c.enabled) return
@@ -1014,7 +1148,7 @@ export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConf
     // 选中同一块库的同一条门记录。零交集的多实例本来无共享状态，无需共门。
     const gateWorkspaces = [...new Set(windowIndex.values())].sort()
     if (gateWorkspaces.length === 0 || !getDb(gateWorkspaces[0], dir).claimCheckGate(60_000)) return
-    dreamSweepOnce(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled)
+    dreamSweepOnce(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled, modelSpec)
   } catch (error: unknown) {
     console.warn(`[meow-memory] dream sweep failed: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -1028,7 +1162,7 @@ export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConf
  *  自调度（issue #26）：checkMinutes 是活值——每 tick 现读现排下一轮（setInterval 的
  *  周期在启动时定型，改配置永远不生效）；cfg 支持对象（兼容旧调用/测试）或 getter
  *  （活配置）。enabled 状态转换打一行日志（静默跳过与没跑在日志里同形，去观测盲点）。 */
-export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfig | undefined), dir = '.dsh-meow', windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean): () => void {
+export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfig | undefined), dir = '.dsh-meow', windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean, modelSpec?: () => { provider?: string; model?: string } | undefined): () => void {
   const read = typeof cfg === 'function' ? cfg : (): DreamConfig => cfg
   const checkMinutesOf = (c: DreamConfig | undefined): number =>
     typeof c?.checkMinutes === 'number' && Number.isFinite(c.checkMinutes) && c.checkMinutes >= 1 ? c.checkMinutes : 15
@@ -1046,7 +1180,7 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfi
         lastEnabled = c.enabled
         ctx.logger.info(`meow-memory: dream 调度器${c.enabled ? '启用' : '停用'}（配置热生效，issue #26）`)
       }
-      dreamSweepTick(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled)
+      dreamSweepTick(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled, modelSpec)
     } finally {
       arm(checkMinutesOf(c)) // read 抛错时 c=undefined → 按 15min 兜底重排，循环不断
     }
